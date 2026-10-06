@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: screen-share-signaling
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build:server
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: STUN_URLS
+        value: stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302
+      - key: TURN_URLS
+        sync: false
+      - key: TURN_SECRET
+        sync: false

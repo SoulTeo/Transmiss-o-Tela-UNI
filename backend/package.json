@@ -1,0 +1,25 @@
+{
+  "name": "screen-share-backend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "smoke": "node scripts/smoke.mjs",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.1",
+    "socket.io-client": "^4.8.4",
+    "tsx": "^4.19.2",
+    "typescript": "~5.6.3"
+  }
+}

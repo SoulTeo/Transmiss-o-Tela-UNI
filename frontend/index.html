@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#10131b" />
+    <meta name="description" content="Compartilhe sua tela com amigos em uma sala privada." />
+    <title>Sala — compartilhar tela</title>
+    <script>
+      (() => {
+        const key = 'screen-share-gh-pages-route';
+        const saved = sessionStorage.getItem(key);
+        if (saved) {
+          sessionStorage.removeItem(key);
+          history.replaceState(null, '', saved);
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
