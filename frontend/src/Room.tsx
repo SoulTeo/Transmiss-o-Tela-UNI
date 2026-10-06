@@ -14,12 +14,6 @@ type PeerSignal = { from: string; signal: { type: 'offer' | 'answer' | 'candidat
 type ShareAudioSource = 'system' | 'tab' | 'window' | 'none';
 type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
 type ShareStarted = { participantId: string; audioSource: ShareAudioSource };
-type CursorCaptureMode = 'always' | 'motion' | 'never';
-
-function getCursorCaptureMode(track: MediaStreamTrack) {
-  const cursor = (track.getSettings() as MediaTrackSettings & { cursor?: string }).cursor;
-  return cursor === 'always' || cursor === 'motion' || cursor === 'never' ? cursor : undefined;
-}
 
 function normalizedAudioTrackLabel(track: MediaStreamTrack) {
   return track.label.trim().toLocaleLowerCase();
@@ -92,7 +86,7 @@ function describeAudioSource(source: ShareAudioSource | null) {
   }
 }
 
-function Icon({ name }: { name: 'screen' | 'copy' | 'leave' | 'sound' | 'users' | 'lock' | 'spark' | 'cursor' }) {
+function Icon({ name }: { name: 'screen' | 'copy' | 'leave' | 'sound' | 'users' | 'lock' | 'spark' }) {
   const common = { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true as const };
   if (name === 'screen') return <svg {...common}><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>;
   if (name === 'copy') return <svg {...common}><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>;
@@ -100,7 +94,6 @@ function Icon({ name }: { name: 'screen' | 'copy' | 'leave' | 'sound' | 'users' 
   if (name === 'sound') return <svg {...common}><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>;
   if (name === 'lock') return <svg {...common}><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3M12 14v3"/></svg>;
   if (name === 'spark') return <svg {...common}><path d="M12 2v20M2 12h20M4.93 4.93l14.14 14.14M19.07 4.93 4.93 19.07"/></svg>;
-  if (name === 'cursor') return <svg {...common}><path d="m5 3 14 11-7 .6L9 21 5 3Z"/></svg>;
   return <svg {...common}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>;
 }
 
@@ -111,8 +104,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [selfId, setSelfId] = useState('');
   const [sharerId, setSharerId] = useState<string | null>(null);
   const [localSharing, setLocalSharing] = useState(false);
-  const [cursorHidden, setCursorHidden] = useState(false);
-  const [cursorUpdating, setCursorUpdating] = useState(false);
   const [audioSource, setAudioSource] = useState<ShareAudioSource | null>(null);
   const [localAudioNotice, setLocalAudioNotice] = useState('');
   const [connecting, setConnecting] = useState(false);
@@ -130,7 +121,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const mountedRef = useRef(true);
   const joinedRef = useRef(false);
   const localStreamRef = useRef<MediaStream | null>(null);
-  const cursorRestoreModeRef = useRef<CursorCaptureMode | null>(null);
   const peerConnections = useRef(new Map<string, RTCPeerConnection>());
   const peerCreations = useRef(new Map<string, Promise<RTCPeerConnection>>());
   const peerEpochs = useRef(new Map<string, number>());
@@ -164,9 +154,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     const stream = localStreamRef.current;
     if (stream) stream.getTracks().forEach((track) => track.stop());
     localStreamRef.current = null;
-    setCursorHidden(false);
-    setCursorUpdating(false);
-    cursorRestoreModeRef.current = null;
   }, []);
 
   const leaveRoom = useCallback(() => {
@@ -469,9 +456,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       return;
     }
     localStreamRef.current = stream;
-    const initialCursorMode = videoTrack ? getCursorCaptureMode(videoTrack) : undefined;
-    cursorRestoreModeRef.current = initialCursorMode && initialCursorMode !== 'never' ? initialCursorMode : 'motion';
-    setCursorHidden(initialCursorMode === 'never');
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
     setSharerId(selfId);
     setLocalSharing(true);
@@ -490,42 +474,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     setAudioSource(null);
     setLocalAudioNotice('');
     setPlaybackBlocked(false);
-  }
-
-  async function toggleCursorCapture() {
-    const stream = localStreamRef.current;
-    const videoTrack = stream?.getVideoTracks()[0];
-    if (!videoTrack || videoTrack.readyState !== 'live' || cursorUpdating) return;
-
-    const nextHidden = !cursorHidden;
-    const currentMode = getCursorCaptureMode(videoTrack);
-    const targetMode: CursorCaptureMode = nextHidden
-      ? 'never'
-      : cursorRestoreModeRef.current || 'motion';
-    if (nextHidden) {
-      cursorRestoreModeRef.current = currentMode && currentMode !== 'never' ? currentMode : cursorRestoreModeRef.current || 'motion';
-    }
-
-    setCursorUpdating(true);
-    try {
-      await videoTrack.applyConstraints({ cursor: { exact: targetMode } } as MediaTrackConstraints & { cursor: { exact: CursorCaptureMode } });
-      if (localStreamRef.current !== stream || videoTrack.readyState !== 'live') return;
-      if (getCursorCaptureMode(videoTrack) !== targetMode) {
-        throw new Error('Cursor capture mode was not applied');
-      }
-      setCursorHidden(nextHidden);
-      setError('');
-      if (!nextHidden) cursorRestoreModeRef.current = null;
-    } catch {
-      if (nextHidden) cursorRestoreModeRef.current = null;
-      if (localStreamRef.current === stream) {
-        const effectiveMode = getCursorCaptureMode(videoTrack);
-        if (effectiveMode) setCursorHidden(effectiveMode === 'never');
-        setError('Este navegador não permite alterar o cursor durante a transmissão. O cursor continuará no modo atual.');
-      }
-    } finally {
-      setCursorUpdating(false);
-    }
   }
 
   async function copyLink() {
@@ -651,7 +599,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
               <div className="controls-context">{isSharing ? <><i className="red-dot" /> Você está ao vivo</> : sharer ? <><i className="red-dot" /> {sharer.name} está ao vivo</> : 'Pronto para compartilhar'}</div>
               <div className="controls-actions">
                 {sharerId && sharerId !== selfId && remoteHasAudio && <button className={`control-button audio-control ${audioEnabled ? '' : 'control-muted'}`} onClick={toggleAudio}><Icon name="sound" /><span>{audioEnabled ? 'Áudio ligado' : 'Áudio desligado'}</span></button>}
-                {isSharing && <button className={`control-button cursor-control ${cursorHidden ? 'cursor-hidden' : ''}`} onClick={() => void toggleCursorCapture()} disabled={cursorUpdating} aria-pressed={cursorHidden} title={cursorHidden ? 'Clique para voltar a capturar o cursor no modo original.' : 'Clique para impedir que o cursor apareça na transmissão.'}><Icon name="cursor" /><span>{cursorUpdating ? 'Atualizando cursor…' : cursorHidden ? 'Cursor oculto' : 'Cursor visível'}</span></button>}
                 {isSharing ? (
                   <button className="button button-stop" onClick={() => void stopSharing()}><span className="stop-square" /> Parar de compartilhar</button>
                 ) : (
