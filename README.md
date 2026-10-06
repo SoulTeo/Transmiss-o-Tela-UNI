@@ -48,7 +48,9 @@ O projeto não fornece uma infraestrutura TURN hospedada. Para redes que bloquei
 - Códigos de sala aleatórios com seis caracteres; convites expiram após 15 minutos sem participantes, com limpeza periódica. O servidor limita cada sala a 20 conexões e mantém um teto de 2.000 salas reservadas.
 - Apelidos limitados a 24 caracteres e eventos de sinalização validados no servidor.
 - Uma transmissão de tela por vez. Outras pessoas podem assistir; uma nova transmissão é recusada até a atual parar.
-- O navegador pede permissão de captura. Áudio da tela só é enviado quando o navegador e a seleção de captura o disponibilizam.
+- O botão muda para **Parar de compartilhar** durante a transmissão. Encerrar pela interface do navegador também encerra a transmissão na sala.
+- Tela inteira solicita o áudio do sistema; uma aba só envia a faixa de áudio daquela aba quando o navegador a fornece. Para janelas, Chromium 141 ou mais recente recebe o pedido de áudio isolado da janela; em outros navegadores, qualquer faixa de áudio da janela é descartada por segurança.
+- A origem é identificada pela superfície reportada pelo navegador. Se a origem não puder ser identificada ou não houver uma faixa segura/separada, o vídeo segue sem áudio e a interface informa o motivo.
 - Se o navegador bloquear a reprodução automática, aparece o botão **Ativar áudio da transmissão** ou **Reproduzir transmissão**; é preciso clicar para liberar a reprodução.
 - Uma pessoa que entra durante uma transmissão recebe uma conexão WebRTC do participante que está compartilhando.
 - Ao desconectar, o servidor remove a pessoa e atualiza a sala. O cliente tenta reconectar automaticamente.

@@ -89,8 +89,8 @@ try {
 
   const participantTwo = sockets[1];
   const receivedStarted = waitFor(participantTwo, 'stream:started', (event) => event.participantId === first.id);
-  assert.equal((await emitAck(first, 'stream:start', { roomId })).ok, true);
-  await receivedStarted;
+  assert.equal((await emitAck(first, 'stream:start', { roomId, audioSource: 'window' })).ok, true);
+  assert.equal((await receivedStarted).audioSource, 'window');
   assert.equal((await emitAck(participantTwo, 'stream:start', { roomId })).ok, false);
 
   const forwardedSignal = waitFor(first, 'rtc:signal', (message) => message.from === participantTwo.id);
@@ -105,7 +105,9 @@ try {
   const receivedStopped = waitFor(participantTwo, 'stream:stopped', (event) => event.participantId === first.id);
   await emitAck(first, 'stream:stop', { roomId });
   await receivedStopped;
-  assert.equal((await emitAck(participantTwo, 'stream:start', { roomId })).ok, true);
+  const receivedSecondStarted = waitFor(sockets[2], 'stream:started', (event) => event.participantId === participantTwo.id);
+  assert.equal((await emitAck(participantTwo, 'stream:start', { roomId, audioSource: 'tab' })).ok, true);
+  assert.equal((await receivedSecondStarted).audioSource, 'tab');
 
   const participantTwoId = participantTwo.id;
   const participantLeft = waitFor(first, 'participant:left', (event) => event.participantId === participantTwoId);

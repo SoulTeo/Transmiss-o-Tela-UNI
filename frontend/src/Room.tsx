@@ -8,8 +8,67 @@ type JoinResult = ServerAck<{
   self: Participant;
   participants: Participant[];
   sharerId: string | null;
+  audioSource: ShareAudioSource | null;
 }>;
 type PeerSignal = { from: string; signal: { type: 'offer' | 'answer' | 'candidate'; value: RTCSessionDescriptionInit | RTCIceCandidateInit } };
+type ShareAudioSource = 'system' | 'tab' | 'window' | 'none';
+type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
+type ShareStarted = { participantId: string; audioSource: ShareAudioSource };
+
+function supportsWindowAudioSelection() {
+  const version = navigator.userAgent.match(/(?:Chrome|Chromium|Edg|OPR)\/(\d+)/)?.[1];
+  return Number(version) >= 141;
+}
+
+function prepareCaptureAudio(stream: MediaStream, supportsWindowAudio: boolean) {
+  const displaySurface = stream.getVideoTracks()[0]?.getSettings().displaySurface as ShareSurface | undefined;
+  const surface: ShareSurface = displaySurface === 'monitor' || displaySurface === 'browser' || displaySurface === 'window'
+    ? displaySurface
+    : 'unknown';
+  const audioTracks = stream.getAudioTracks();
+  const liveAudioTracks = audioTracks.filter((track) => track.readyState === 'live');
+  let audioSource: ShareAudioSource = 'none';
+  let message = '';
+
+  if (surface === 'unknown' || (surface === 'window' && !supportsWindowAudio)) {
+    for (const track of audioTracks) {
+      stream.removeTrack(track);
+      track.stop();
+    }
+    message = surface === 'window'
+      ? 'Este navegador não confirma captura isolada do áudio desta janela. A tela está sendo transmitida sem áudio.'
+      : 'Não foi possível identificar a origem da captura. A tela está sendo transmitida sem áudio por segurança.';
+  } else if (liveAudioTracks.length > 0) {
+    audioSource = surface === 'monitor' ? 'system' : surface === 'browser' ? 'tab' : 'window';
+    message = audioSource === 'system'
+      ? 'Áudio do sistema inteiro incluído na transmissão.'
+      : audioSource === 'tab'
+        ? 'Somente o áudio da aba selecionada foi incluído.'
+        : 'Somente o áudio isolado da janela selecionada foi incluído.';
+  } else {
+    for (const track of audioTracks) {
+      stream.removeTrack(track);
+      track.stop();
+    }
+    message = surface === 'monitor'
+      ? 'A tela está sendo transmitida sem áudio do sistema; o navegador não disponibilizou uma faixa de áudio.'
+      : surface === 'browser'
+        ? 'A aba está sendo transmitida sem áudio; o navegador não disponibilizou uma faixa separada para ela.'
+        : 'O navegador não disponibilizou áudio isolado para esta janela. Nenhum áudio do computador será enviado.';
+  }
+
+  return { audioSource, message };
+}
+
+function describeAudioSource(source: ShareAudioSource | null) {
+  switch (source) {
+    case 'system': return 'Áudio do sistema inteiro incluído na transmissão.';
+    case 'tab': return 'Somente o áudio da aba selecionada foi incluído.';
+    case 'window': return 'Somente o áudio isolado da janela selecionada foi incluído.';
+    case 'none': return 'Esta origem não disponibilizou áudio isolado; a transmissão está sem áudio.';
+    default: return 'O áudio depende da origem selecionada e do que o navegador disponibilizar.';
+  }
+}
 
 function Icon({ name }: { name: 'screen' | 'copy' | 'leave' | 'sound' | 'users' | 'lock' | 'spark' }) {
   const common = { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true as const };
@@ -28,6 +87,9 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [selfId, setSelfId] = useState('');
   const [sharerId, setSharerId] = useState<string | null>(null);
+  const [localSharing, setLocalSharing] = useState(false);
+  const [audioSource, setAudioSource] = useState<ShareAudioSource | null>(null);
+  const [localAudioNotice, setLocalAudioNotice] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [connectionLost, setConnectionLost] = useState(false);
   const [error, setError] = useState('');
@@ -50,7 +112,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
 
   const sharer = useMemo(() => participants.find((person) => person.id === sharerId), [participants, sharerId]);
-  const isSharing = joined && sharerId === selfId && Boolean(localStreamRef.current);
+  const isSharing = joined && localSharing;
   const shareUrl = `${window.location.origin}${roomPath(roomId)}`;
 
   const closePeer = useCallback((peerId: string, clearCandidates = true) => {
@@ -90,6 +152,8 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     setParticipants([]);
     setJoined(false);
     setSharerId(null);
+    setLocalSharing(false);
+    setAudioSource(null);
     onHome();
   }, [closeAllPeers, onHome, roomId, stopLocalTracks]);
 
@@ -225,6 +289,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       setSelfId(result.self.id);
       setParticipants(result.participants);
       setSharerId(result.sharerId);
+      setAudioSource(result.sharerId ? result.audioSource : null);
       sessionStorage.setItem('screen-share-name', cleanName);
     });
   }, [roomId]);
@@ -254,6 +319,8 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       closeAllPeers();
       stopLocalTracks();
       setSharerId(null);
+      setLocalSharing(false);
+      setAudioSource(null);
     });
     socket.on('connect_error', () => setConnectionLost(true));
     socket.on('participant:joined', (participant: Participant) => {
@@ -264,8 +331,9 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       setParticipants((current) => current.filter((person) => person.id !== participantId));
       closePeer(participantId);
     });
-    socket.on('stream:started', ({ participantId }: { participantId: string }) => {
+    socket.on('stream:started', ({ participantId, audioSource: incomingAudioSource }: ShareStarted) => {
       setSharerId(participantId);
+      setAudioSource(incomingAudioSource);
       setRemoteHasAudio(null);
       setPlaybackBlocked(false);
       setError('');
@@ -276,11 +344,14 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     });
     socket.on('stream:stopped', ({ participantId }: { participantId: string }) => {
       setSharerId((current) => current === participantId ? null : current);
+      setAudioSource(null);
       setRemoteHasAudio(false);
       setPlaybackBlocked(false);
       if (participantId === selfIdRef.current) {
         closeAllPeers();
         stopLocalTracks();
+        setLocalSharing(false);
+        setLocalAudioNotice('');
       } else {
         closePeer(participantId);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
@@ -325,31 +396,54 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       setError('Este navegador não permite compartilhar a tela. Experimente a versão mais recente do Chrome, Edge ou Firefox no computador.');
       return;
     }
+    const supportsWindowAudio = supportsWindowAudioSelection();
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      const options = {
+        video: true,
+        audio: true,
+        systemAudio: 'include',
+        windowAudio: supportsWindowAudio ? 'window' : 'exclude',
+      } as DisplayMediaStreamOptions & { systemAudio: 'include'; windowAudio: 'window' | 'exclude' };
+      stream = await navigator.mediaDevices.getDisplayMedia(options);
     } catch (captureError) {
       if (captureError instanceof DOMException && captureError.name === 'NotAllowedError') return;
       setError('Não foi possível iniciar a captura. Verifique as permissões do navegador e tente novamente.');
       return;
     }
 
+    const captureAudio = prepareCaptureAudio(stream, supportsWindowAudio);
+    setLocalAudioNotice(captureAudio.message);
+    const videoTrack = stream.getVideoTracks()[0];
+    let captureEnded = videoTrack?.readyState === 'ended';
+    videoTrack?.addEventListener('ended', () => {
+      captureEnded = true;
+      if (localStreamRef.current === stream) void stopSharing();
+    }, { once: true });
+
     const result = await new Promise<ServerAck>((resolve) => {
       const timer = window.setTimeout(() => resolve({ ok: false, error: 'O servidor não confirmou o início. Confira a conexão e tente novamente.' }), 8000);
-      socketRef.current?.emit('stream:start', { roomId }, (acknowledgement: ServerAck) => {
+      socketRef.current?.emit('stream:start', { roomId, audioSource: captureAudio.audioSource }, (acknowledgement: ServerAck) => {
         window.clearTimeout(timer);
         resolve(acknowledgement);
       });
     });
     if (!result?.ok) {
+      socketRef.current?.emit('stream:stop', { roomId });
       stream.getTracks().forEach((track) => track.stop());
+      setLocalAudioNotice('');
       setError(result?.error || 'Outra pessoa já está compartilhando. Aguarde a transmissão terminar.');
+      return;
+    }
+    if (captureEnded || videoTrack?.readyState === 'ended') {
+      await stopSharing();
+      stream.getTracks().forEach((track) => track.stop());
       return;
     }
     localStreamRef.current = stream;
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
     setSharerId(selfId);
-    stream.getVideoTracks()[0]?.addEventListener('ended', () => void stopSharing());
+    setLocalSharing(true);
     for (const participant of participants) {
       if (participant.id !== selfId) void negotiateWith(participant.id);
     }
@@ -361,6 +455,9 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     closeAllPeers();
     stopLocalTracks();
     setSharerId(null);
+    setLocalSharing(false);
+    setAudioSource(null);
+    setLocalAudioNotice('');
     setPlaybackBlocked(false);
   }
 
@@ -458,7 +555,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
                       {remoteHasAudio ? 'Ativar áudio da transmissão' : 'Reproduzir transmissão'}
                     </button>
                   )}
-                  {remoteHasAudio === false && sharerId !== selfId && <div className="audio-caption">Áudio não disponibilizado pelo navegador de quem está compartilhando.</div>}
+                  {remoteHasAudio === false && sharerId !== selfId && <div className="audio-caption">Esta transmissão não tem uma faixa de áudio disponível.</div>}
                 </>
               ) : (
                 <div className="empty-stage">
@@ -488,7 +585,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
               <div className="controls-actions">
                 {sharerId && sharerId !== selfId && remoteHasAudio && <button className={`control-button audio-control ${audioEnabled ? '' : 'control-muted'}`} onClick={toggleAudio}><Icon name="sound" /><span>{audioEnabled ? 'Áudio ligado' : 'Áudio desligado'}</span></button>}
                 {isSharing ? (
-                  <button className="button button-stop" onClick={() => void stopSharing()}><span className="stop-square" /> Parar compartilhamento</button>
+                  <button className="button button-stop" onClick={() => void stopSharing()}><span className="stop-square" /> Parar de compartilhar</button>
                 ) : (
                   <button className="button button-primary share-button" onClick={() => void startSharing()} disabled={Boolean(sharerId) || connectionLost} title={sharerId ? 'Aguarde a transmissão atual terminar' : undefined}>
                     <Icon name="screen" /> Compartilhar tela
@@ -497,7 +594,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
                 <button className="button button-leave" onClick={leaveRoom}><Icon name="leave" /> Sair</button>
               </div>
             </div>
-            <p className="screen-audio-note">O áudio da tela depende do navegador, do sistema e da opção selecionada na janela de compartilhamento.</p>
+            <p className="screen-audio-note">{isSharing ? localAudioNotice : sharerId ? describeAudioSource(audioSource) : 'O áudio depende do navegador e da origem escolhida na janela de compartilhamento.'}</p>
           </>
         )}
       </div>

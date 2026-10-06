@@ -5,10 +5,12 @@ import express from 'express';
 import { Server, type Socket } from 'socket.io';
 
 type Participant = { id: string; name: string };
+type ShareAudioSource = 'system' | 'tab' | 'window' | 'none';
 type IceServer = { urls: string | string[]; username?: string; credential?: string };
 type Room = {
   participants: Map<string, Participant>;
   sharerId: string | null;
+  audioSource: ShareAudioSource | null;
   emptyUntil: number | null;
 };
 type Ack = (response: Record<string, unknown>) => void;
@@ -74,7 +76,7 @@ roomCleanup.unref();
 function getRoom(roomId: string): Room {
   let room = rooms.get(roomId);
   if (!room) {
-    room = { participants: new Map(), sharerId: null, emptyUntil: null };
+    room = { participants: new Map(), sharerId: null, audioSource: null, emptyUntil: null };
     rooms.set(roomId, room);
   }
   return room;
@@ -128,6 +130,7 @@ function leaveCurrentRoom(socket: Socket) {
 
   if (room.sharerId === socket.id) {
     room.sharerId = null;
+    room.audioSource = null;
     io.to(roomId).emit('stream:stopped', { participantId: socket.id });
   }
 
@@ -135,6 +138,7 @@ function leaveCurrentRoom(socket: Socket) {
   if (room.participants.size === 0) {
     room.emptyUntil = Date.now() + 15 * 60_000;
     room.sharerId = null;
+    room.audioSource = null;
   }
 }
 
@@ -195,10 +199,11 @@ io.on('connection', (socket) => {
       self: participant,
       participants: [...existingParticipants, participant],
       sharerId: room.sharerId,
+      audioSource: room.audioSource,
     });
     socket.to(roomId).emit('participant:joined', participant);
     if (room.sharerId) {
-      socket.emit('stream:started', { participantId: room.sharerId });
+      socket.emit('stream:started', { participantId: room.sharerId, audioSource: room.audioSource || 'none' });
     }
   });
 
@@ -219,8 +224,13 @@ io.on('connection', (socket) => {
       ack(callback, { ok: false, error: 'Outra pessoa já está compartilhando. Aguarde a transmissão terminar.' });
       return;
     }
+    const audioSources: ShareAudioSource[] = ['system', 'tab', 'window', 'none'];
+    const audioSource = audioSources.includes(input.audioSource as ShareAudioSource)
+      ? input.audioSource as ShareAudioSource
+      : 'none';
     room.sharerId = socket.id;
-    io.to(roomId).emit('stream:started', { participantId: socket.id });
+    room.audioSource = audioSource;
+    io.to(roomId).emit('stream:started', { participantId: socket.id, audioSource });
     ack(callback, { ok: true });
   });
 
@@ -230,6 +240,7 @@ io.on('connection', (socket) => {
     const room = roomId ? rooms.get(roomId) : undefined;
     if (roomId && room && input.roomId === roomId && room.sharerId === socket.id) {
       room.sharerId = null;
+      room.audioSource = null;
       io.to(roomId).emit('stream:stopped', { participantId: socket.id });
     }
     ack(callback, { ok: true });
