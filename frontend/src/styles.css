@@ -17,3 +17,5 @@ html{scrollbar-color:#434a5b #10131b}
 ::-webkit-scrollbar-thumb{background:#434a5b;border:2px solid #10131b;border-radius:8px}
 
 @media(max-width:700px){.copy-button .copy-label{display:none}.copy-button.copy-copied .copy-label,.copy-button.copy-failed .copy-label{display:inline;font-size:9px}}
+.cursor-control.cursor-hidden{color:#c6b9ff;background:#28233f;border-color:#554583}.cursor-control svg{width:16px;height:16px}
+@media(max-width:700px){.cursor-control{display:none}}
