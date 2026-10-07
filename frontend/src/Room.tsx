@@ -85,28 +85,6 @@ async function applyVideoSenderProfile(sender: RTCRtpSender, bitrate: number, fr
   return true;
 }
 
-function normalizedAudioTrackLabel(track: MediaStreamTrack) {
-  return track.label.trim().toLocaleLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-}
-
-function isApplicationAudioTrack(track: MediaStreamTrack) {
-  const label = normalizedAudioTrackLabel(track);
-  if (isSystemAudioTrack(track)) return false;
-  return /(?:application|app|window|janela|aplicativo|aplicacao).*(?:audio|sound|som)|(?:audio|sound|som).*(?:application|app|window|janela|aplicativo|aplicacao)/.test(label);
-}
-
-function isSystemAudioTrack(track: MediaStreamTrack) {
-  const label = normalizedAudioTrackLabel(track);
-  return /system audio|desktop audio|audio do sistema|audio do computador|som do sistema|som do computador|audio geral/.test(label);
-}
-
-function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
-  for (const track of tracks) {
-    stream.removeTrack(track);
-    track.stop();
-  }
-}
-
 function prepareCaptureAudio(stream: MediaStream) {
   const displaySurface = stream.getVideoTracks()[0]?.getSettings().displaySurface as ShareSurface | undefined;
   const surface: ShareSurface = displaySurface === 'monitor' || displaySurface === 'browser' || displaySurface === 'window'
@@ -118,36 +96,15 @@ function prepareCaptureAudio(stream: MediaStream) {
   let message = '';
 
   if (surface === 'unknown') {
-    discardAudioTracks(stream, audioTracks);
-    message = 'Não foi possível identificar a origem da captura. A tela está sendo transmitida sem áudio por segurança.';
+    message = liveAudioTracks.length > 0
+      ? 'O navegador retornou áudio, mas não identificou a superfície da captura; o áudio foi mantido e será enviado pelo WebRTC.'
+      : 'Não foi possível identificar a origem da captura; o navegador não disponibilizou áudio.';
   } else if (surface === 'window') {
-    const isolatedWindowAudio = liveAudioTracks.filter(isApplicationAudioTrack);
-    const audioTrackLabel = liveAudioTracks.map((track) => track.label.trim()).filter(Boolean).join(', ');
-    const hasSystemAudio = liveAudioTracks.some(isSystemAudioTrack);
-    // Labels are not standardized. When the browser returns one audio track for
-    // a window capture requested with windowAudio:'window', accept it unless the
-    // browser explicitly identifies it as system-wide audio.
-    const unclassifiedWindowAudio = isolatedWindowAudio.length === 0
-      && liveAudioTracks.length === 1
-      && !hasSystemAudio
-      ? liveAudioTracks
-      : [];
-    const acceptedWindowAudio = isolatedWindowAudio.length > 0 ? isolatedWindowAudio : unclassifiedWindowAudio;
-    discardAudioTracks(stream, audioTracks.filter((track) => !acceptedWindowAudio.includes(track)));
-
-    if (isolatedWindowAudio.length > 0) {
+    if (liveAudioTracks.length > 0) {
       audioSource = 'window';
-      const acceptedLabels = isolatedWindowAudio.map((track) => track.label.trim()).filter(Boolean).join(', ');
-      message = `Áudio da janela recebido${acceptedLabels ? ` (${acceptedLabels})` : ''}. O navegador pode capturar outras janelas do mesmo aplicativo.`;
-    } else if (unclassifiedWindowAudio.length > 0) {
-      audioSource = 'window';
-      message = `O navegador entregou uma faixa de áudio para a janela${audioTrackLabel ? ` (“${audioTrackLabel}”)` : ''}. Ela foi encaminhada com a preferência windowAudio:"window"; o navegador não identificou a faixa pelo rótulo, então o isolamento depende do suporte dele.`;
-    } else if (hasSystemAudio) {
-      message = `O navegador forneceu “${audioTrackLabel || 'áudio do sistema'}” para esta janela. Essa faixa foi bloqueada para não transmitir sons de outros aplicativos; a janela seguirá sem áudio.`;
-    } else if (liveAudioTracks.length > 0) {
-      message = `O navegador forneceu uma faixa${audioTrackLabel ? ` (“${audioTrackLabel}”)` : ''}, mas não identificou que ela pertence à janela. Ela foi bloqueada por segurança; a janela seguirá sem áudio.`;
+      message = 'Faixa de áudio retornada junto com a captura da janela e encaminhada pelo WebRTC. O isolamento da origem depende do suporte do navegador a windowAudio:"window".';
     } else {
-      message = 'O navegador não disponibilizou uma faixa de áudio isolada para esta janela. Confira se a opção de compartilhar áudio da janela está marcada no seletor do navegador e se o Edge/Chrome está atualizado; áudio do sistema inteiro continuará bloqueado neste modo.';
+      message = 'O navegador não retornou uma faixa de áudio junto com a captura desta janela. Confira se a opção de compartilhar áudio da janela está marcada no seletor do navegador e se o Edge/Chrome está atualizado.';
     }
   } else if (liveAudioTracks.length > 0) {
     audioSource = surface === 'monitor' ? 'system' : 'tab';
@@ -155,7 +112,6 @@ function prepareCaptureAudio(stream: MediaStream) {
       ? 'Áudio do sistema inteiro incluído na transmissão.'
       : 'Somente o áudio da aba selecionada foi incluído.';
   } else {
-    discardAudioTracks(stream, audioTracks);
     message = surface === 'monitor'
       ? 'A tela está sendo transmitida sem áudio do sistema; o navegador não disponibilizou uma faixa de áudio.'
       : 'A aba está sendo transmitida sem áudio; o navegador não disponibilizou uma faixa separada para ela.';
