@@ -100,11 +100,6 @@ function isSystemAudioTrack(track: MediaStreamTrack) {
   return /system audio|desktop audio|audio do sistema|audio do computador|som do sistema|som do computador|audio geral/.test(label);
 }
 
-function supportsChromiumWindowAudioPreference() {
-  const chromiumVersion = navigator.userAgent.match(/(?:Edg|Chrome)\/(\d+)/)?.[1];
-  return Number(chromiumVersion) >= 141;
-}
-
 function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
   for (const track of tracks) {
     stream.removeTrack(track);
@@ -129,13 +124,12 @@ function prepareCaptureAudio(stream: MediaStream) {
     const isolatedWindowAudio = liveAudioTracks.filter(isApplicationAudioTrack);
     const audioTrackLabel = liveAudioTracks.map((track) => track.label.trim()).filter(Boolean).join(', ');
     const hasSystemAudio = liveAudioTracks.some(isSystemAudioTrack);
-    // Chromium 141+ supports windowAudio:'window'. Some builds return a generic
-    // track label for app loopback; accept one such track only on those builds,
-    // while still rejecting a track explicitly identified as system audio.
+    // Labels are not standardized. When the browser returns one audio track for
+    // a window capture requested with windowAudio:'window', accept it unless the
+    // browser explicitly identifies it as system-wide audio.
     const unclassifiedWindowAudio = isolatedWindowAudio.length === 0
       && liveAudioTracks.length === 1
       && !hasSystemAudio
-      && supportsChromiumWindowAudioPreference()
       ? liveAudioTracks
       : [];
     const acceptedWindowAudio = isolatedWindowAudio.length > 0 ? isolatedWindowAudio : unclassifiedWindowAudio;
@@ -794,6 +788,19 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       setError('Não foi possível iniciar a captura. Verifique as permissões do navegador e tente novamente.');
       return;
     }
+
+    const returnedAudioTracks = stream.getAudioTracks();
+    console.info('[screen-share] Captura retornada por getDisplayMedia()', JSON.stringify({
+      displaySurface: stream.getVideoTracks()[0]?.getSettings().displaySurface,
+      audioTracks: returnedAudioTracks.map((track) => ({
+        id: track.id,
+        label: track.label,
+        readyState: track.readyState,
+        muted: track.muted,
+        enabled: track.enabled,
+        settings: track.getSettings(),
+      })),
+    }));
 
     const captureAudio = prepareCaptureAudio(stream);
     setLocalAudioNotice(captureAudio.message);
