@@ -264,6 +264,16 @@ io.on('connection', (socket) => {
     io.to(targetId).emit('rtc:signal', { from: socket.id, signal });
   });
 
+  socket.on('rtc:restart-request', (payload: unknown) => {
+    const roomId = socket.data.roomId as string | undefined;
+    const input = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+    const room = roomId ? rooms.get(roomId) : undefined;
+    const sharerId = room?.sharerId;
+    if (!room || input.roomId !== roomId || !room.participants.has(socket.id) || !sharerId || sharerId === socket.id) return;
+    if (!room.participants.has(sharerId)) return;
+    io.to(sharerId).emit('rtc:restart-request', { from: socket.id });
+  });
+
   socket.on('disconnecting', () => leaveCurrentRoom(socket));
 });
 

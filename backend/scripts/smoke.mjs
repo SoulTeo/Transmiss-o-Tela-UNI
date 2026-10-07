@@ -102,6 +102,10 @@ try {
   const forwarded = await forwardedSignal;
   assert.equal(forwarded.signal.type, 'answer');
 
+  const recoveryRequested = waitFor(first, 'rtc:restart-request', (event) => event.from === participantTwo.id);
+  participantTwo.emit('rtc:restart-request', { roomId });
+  await recoveryRequested;
+
   const receivedStopped = waitFor(participantTwo, 'stream:stopped', (event) => event.participantId === first.id);
   await emitAck(first, 'stream:stop', { roomId });
   await receivedStopped;
@@ -113,7 +117,7 @@ try {
   const participantLeft = waitFor(first, 'participant:left', (event) => event.participantId === participantTwoId);
   participantTwo.disconnect();
   await participantLeft;
-  console.log('Sinalização validada: health/CORS/STUN, sala e limite de criação, código inexistente, 20 participantes, bloqueio de dupla transmissão, eventos WebRTC, parada e desconexão.');
+  console.log('Sinalização validada: health/CORS/STUN, sala e limite de criação, código inexistente, 20 participantes, bloqueio de dupla transmissão, eventos WebRTC e pedido de recuperação, parada e desconexão.');
 } finally {
   for (const socket of sockets) socket.disconnect();
 }

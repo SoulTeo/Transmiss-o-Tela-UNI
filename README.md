@@ -57,6 +57,28 @@ O projeto não fornece uma infraestrutura TURN hospedada. Para redes que bloquei
 
 WebRTC P2P conecta o participante que transmite diretamente a cada espectador. O limite de 20 atende ao grupo alvo, mas quem transmite envia uma cópia da mídia a cada participante; conexões com muitos espectadores ou upload limitado podem ficar instáveis. Migrar para um SFU seria o próximo passo se isso ocorrer.
 
+## Captura, adaptação e diagnóstico WebRTC
+
+- A captura pede 1280×720 a 30 FPS, com limites de 1920×1080 e 30 FPS para evitar captura 4K/60 desnecessária. São preferências/limites da captura do navegador; cada sistema pode fornecer uma resolução ou cadência menor.
+- A prévia de quem transmite usa diretamente o `MediaStream` capturado. O vídeo não passa por canvas, filtros ou cópias para redimensionamento em JavaScript. As faixas de áudio continuam seguindo as regras por origem descritas acima.
+- Cada envio de vídeo recebe um teto inicial de até 4 Mbps, dividido por espectador com orçamento de referência de 12 Mbps no total do mesh. A cada 2 segundos o cliente consulta `RTCPeerConnection.getStats()`. Perda, RTT, jitter, estimativa de banda disponível e o motivo de limitação reportado pelo navegador podem reduzir bitrate, resolução e, em condições piores, FPS. A recuperação de qualidade é gradual após amostras estáveis; o controle de congestionamento nativo do WebRTC continua ativo. Esses números são limites iniciais de política, não garantias de bitrate ou de qualidade.
+- A negociação de codec permanece com o navegador para evitar impor um codec incompatível ou mais caro para determinado aparelho. O painel mostra o codec e, quando o navegador fornece esse dado, a implementação do encoder e o tempo médio de codificação por quadro. O navegador também escolhe se usa aceleração de hardware; a aplicação não consegue forçá-la de forma portátil.
+- Abra uma sala com `?debug=webrtc` no endereço, por exemplo `http://localhost:5173/sala/ABC123?debug=webrtc`, para mostrar o painel somente nessa sessão. Ele exibe conexões, estados ICE/PeerConnection, TX/RX, banda estimada, RTT, jitter, perda, FPS, resolução, contadores de quadros, codec, encoder e adaptação aplicada. Métricas indisponíveis aparecem como `—` porque o suporte varia entre navegadores.
+- Se um peer ficar `disconnected` por 5 segundos ou entrar em `failed`, o app tenta uma nova conexão com ICE e renegociação, com espera exponencial e até cinco tentativas. Fechar a sala ou a transmissão cancela temporizadores, conexões e faixas locais.
+- A sinalização continua trafegando apenas entrada/saída da sala, SDP e ICE pelo Socket.IO. O servidor não recebe a mídia; áudio e vídeo continuam P2P. Em malha P2P, cada espectador adiciona outra conexão e cópia de envio, então os limites de bitrate reduzem o consumo, mas não substituem um SFU em grupos grandes.
+
+O navegador não oferece uma API web portátil para ler uso total de CPU, GPU, RAM ou VRAM, nem para obrigar codificação por hardware. `qualityLimitationReason`, implementação de encoder e tempo de codificação são indicadores úteis, não telemetria completa do sistema. Para validar desempenho real, compare o painel com o monitor de tarefas do sistema e repita a matriz abaixo em diferentes dispositivos, navegadores e redes. O build e o smoke test do servidor não simulam perda de rede nem codificação de tela real.
+
+### Matriz manual para validar a mídia
+
+Esses cenários ainda precisam ser exercitados em computadores e conexões reais. Use dois participantes em máquinas separadas e abra `?debug=webrtc` em ambas:
+
+1. Em um computador potente, compartilhe monitor e janela a 1080p/30; confirme que a resolução enviada não passa de 1080p e o FPS reportado fica estável perto de 30. O perfil atual limita a captura a 30 FPS; comparar 60 FPS requer uma variante de experimento com outro teto.
+2. Em um computador intermediário, compartilhe conteúdo com muito movimento e depois conteúdo estático; observe FPS, resolução, encode por quadro e `qualityLimitationReason`.
+3. Em um computador de menor capacidade, verifique o indicador `cpu`, quedas de FPS, estabilidade do áudio e uso de CPU/GPU/RAM no monitor do sistema.
+4. Repita com rede rápida, média e instável usando um limitador de tráfego no roteador ou no sistema operacional. Confira se os níveis de adaptação descem sob perda/RTT/jitter e sobem gradualmente após estabilização.
+5. Teste separadamente guia, janela e tela inteira com áudio, conferindo que guia e janela seguem as faixas disponíveis/seguras e que tela inteira pode transmitir o áudio do sistema. Registre também navegador, sistema operacional, codec/encoder reportados e quantidade de espectadores.
+
 ## Limitações conhecidas
 
 - Captura de tela requer HTTPS (ou `localhost`) e costuma estar disponível apenas em navegadores desktop. Celulares podem entrar e assistir, mas a captura pode não ser suportada pelo sistema/navegador.

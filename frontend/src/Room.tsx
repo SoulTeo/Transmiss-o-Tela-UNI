@@ -14,6 +14,76 @@ type PeerSignal = { from: string; signal: { type: 'offer' | 'answer' | 'candidat
 type ShareAudioSource = 'system' | 'tab' | 'window' | 'none';
 type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
 type ShareStarted = { participantId: string; audioSource: ShareAudioSource };
+type WebRtcStatsItem = { id?: string; type: string; [key: string]: unknown };
+type PeerDiagnostic = {
+  peerId: string;
+  connectionState: string;
+  iceState: string;
+  sentBitrate: number;
+  receivedBitrate: number;
+  availableOutgoingBitrate?: number;
+  roundTripTime?: number;
+  jitter?: number;
+  packetLoss?: number;
+  fps?: number;
+  width?: number;
+  height?: number;
+  framesSent?: number;
+  framesLost?: number;
+  framesDecoded?: number;
+  framesDropped?: number;
+  codec?: string;
+  encoder?: string;
+  encodeMillisecondsPerFrame?: number;
+  qualityReason?: string;
+  adaptationLevel?: number;
+  bitrateLimit?: number;
+};
+type PreviousPeerCounters = { sampledAt: number; bytesSent: number; bytesReceived: number };
+type AdaptiveQualityState = {
+  level: number;
+  healthySamples: number;
+  appliedBitrate?: number;
+  appliedFramerate?: number;
+  appliedScale?: number;
+};
+
+const MAX_PEER_VIDEO_BITRATE = 4_000_000;
+const TOTAL_MESH_VIDEO_BUDGET = 12_000_000;
+const MIN_PEER_VIDEO_BITRATE = 250_000;
+const CAPTURE_FRAME_RATE = 30;
+const DEBUG_WEBRTC = new URLSearchParams(window.location.search).get('debug') === 'webrtc';
+const ADAPTATION_LEVELS = [
+  { factor: 1, framerate: 30, scale: 1 },
+  { factor: 0.8, framerate: 30, scale: 1.2 },
+  { factor: 0.66, framerate: 24, scale: 1.35 },
+  { factor: 0.5, framerate: 15, scale: 1.6 },
+];
+
+function numberStat(stat: WebRtcStatsItem | undefined, key: string) {
+  const value = stat?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function stringStat(stat: WebRtcStatsItem | undefined, key: string) {
+  const value = stat?.[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function initialVideoBitrateForMesh(peerCount: number) {
+  return Math.max(MIN_PEER_VIDEO_BITRATE, Math.min(MAX_PEER_VIDEO_BITRATE, Math.floor(TOTAL_MESH_VIDEO_BUDGET / Math.max(1, peerCount))));
+}
+
+async function applyVideoSenderProfile(sender: RTCRtpSender, bitrate: number, framerate: number, scale: number) {
+  const parameters = sender.getParameters();
+  if (!parameters.encodings?.length) return false;
+  parameters.degradationPreference = 'maintain-framerate';
+  parameters.encodings[0].maxBitrate = bitrate;
+  parameters.encodings[0].maxFramerate = framerate;
+  parameters.encodings[0].scaleResolutionDownBy = scale;
+  await sender.setParameters(parameters);
+  return true;
+}
 
 function normalizedAudioTrackLabel(track: MediaStreamTrack) {
   return track.label.trim().toLocaleLowerCase();
@@ -113,11 +183,14 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [remoteHasAudio, setRemoteHasAudio] = useState<boolean | null>(null);
   const [playbackBlocked, setPlaybackBlocked] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
+  const [peerDiagnostics, setPeerDiagnostics] = useState<PeerDiagnostic[]>([]);
 
   const socketRef = useRef<Socket | null>(null);
   const nameRef = useRef(name);
   const selfIdRef = useRef('');
+  const sharerIdRef = useRef<string | null>(null);
   nameRef.current = name;
+  sharerIdRef.current = sharerId;
   const mountedRef = useRef(true);
   const joinedRef = useRef(false);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -125,6 +198,13 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const peerCreations = useRef(new Map<string, Promise<RTCPeerConnection>>());
   const peerEpochs = useRef(new Map<string, number>());
   const pendingCandidates = useRef(new Map<string, RTCIceCandidateInit[]>());
+  const previousPeerCounters = useRef(new Map<string, PreviousPeerCounters>());
+  const adaptiveQuality = useRef(new Map<string, AdaptiveQualityState>());
+  const recoveryTimers = useRef(new Map<string, number>());
+  const recoveryAttempts = useRef(new Map<string, number>());
+  const schedulePeerRecoveryRef = useRef<(peerId: string) => void>(() => undefined);
+  const participantsRef = useRef(participants);
+  participantsRef.current = participants;
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
 
   const sharer = useMemo(() => participants.find((person) => person.id === sharerId), [participants, sharerId]);
@@ -143,11 +223,19 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       peerConnections.current.delete(peerId);
     }
     if (clearCandidates) pendingCandidates.current.delete(peerId);
+    previousPeerCounters.current.delete(peerId);
+    adaptiveQuality.current.delete(peerId);
+    const recoveryTimer = recoveryTimers.current.get(peerId);
+    if (recoveryTimer !== undefined) {
+      window.clearTimeout(recoveryTimer);
+      recoveryTimers.current.delete(peerId);
+    }
   }, []);
 
   const closeAllPeers = useCallback(() => {
     const peerIds = new Set([...peerConnections.current.keys(), ...peerCreations.current.keys()]);
     for (const peerId of peerIds) closePeer(peerId);
+    recoveryAttempts.current.clear();
   }, [closePeer]);
 
   const stopLocalTracks = useCallback(() => {
@@ -210,12 +298,57 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
         }
       };
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') closePeer(peerId);
+        if (pc.connectionState === 'connected') {
+          recoveryAttempts.current.delete(peerId);
+          const retryTimer = recoveryTimers.current.get(peerId);
+          if (retryTimer !== undefined) {
+            window.clearTimeout(retryTimer);
+            recoveryTimers.current.delete(peerId);
+          }
+        } else if (pc.connectionState === 'disconnected') {
+          if (!recoveryTimers.current.has(peerId)) {
+            const disconnectTimer = window.setTimeout(() => {
+              recoveryTimers.current.delete(peerId);
+              if (pc.connectionState !== 'disconnected') return;
+              if (stream && localStreamRef.current === stream) {
+                schedulePeerRecoveryRef.current(peerId);
+              } else {
+                socketRef.current?.emit('rtc:restart-request', { roomId });
+                closePeer(peerId);
+              }
+            }, 5_000);
+            recoveryTimers.current.set(peerId, disconnectTimer);
+          }
+        } else if (pc.connectionState === 'failed') {
+          const disconnectTimer = recoveryTimers.current.get(peerId);
+          if (disconnectTimer !== undefined) {
+            window.clearTimeout(disconnectTimer);
+            recoveryTimers.current.delete(peerId);
+          }
+          if (stream && localStreamRef.current === stream) {
+            schedulePeerRecoveryRef.current(peerId);
+          } else {
+            socketRef.current?.emit('rtc:restart-request', { roomId });
+            closePeer(peerId);
+          }
+        } else if (pc.connectionState === 'closed') {
+          closePeer(peerId);
+        }
       };
 
       try {
         if (stream) {
-          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+          const senders = stream.getTracks().map((track) => pc.addTrack(track, stream));
+          const videoSender = senders.find((sender) => sender.track?.kind === 'video');
+          if (videoSender) {
+            const peerCount = Math.max(1, participantsRef.current.length - 1);
+            try {
+              await applyVideoSenderProfile(videoSender, initialVideoBitrateForMesh(peerCount), CAPTURE_FRAME_RATE, 1);
+            } catch {
+              // The browser's native congestion controller remains the fallback when sender limits are unsupported.
+            }
+            adaptiveQuality.current.set(peerId, { level: 0, healthySamples: 0 });
+          }
           const description = await pc.createOffer();
           await pc.setLocalDescription(description);
           sendSignal(peerId, { type: 'offer', value: pc.localDescription!.toJSON() });
@@ -234,6 +367,32 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     );
     return creation;
   }, [closePeer, sendSignal]);
+
+  const schedulePeerRecovery = useCallback((peerId: string) => {
+    if (recoveryTimers.current.has(peerId)) return;
+    const attempts = recoveryAttempts.current.get(peerId) || 0;
+    if (attempts >= 5) {
+      setError('A conexão com um participante caiu. A transmissão continua, mas pode ser necessário entrar novamente na sala.');
+      return;
+    }
+    recoveryAttempts.current.set(peerId, attempts + 1);
+    const delay = Math.min(8_000, 750 * (2 ** attempts));
+    const timer = window.setTimeout(() => {
+      recoveryTimers.current.delete(peerId);
+      closePeer(peerId);
+      if (localStreamRef.current && joinedRef.current) {
+        void createPeer(peerId, true).catch(() => {
+          if ((recoveryAttempts.current.get(peerId) || 0) >= 5) {
+            setError('Não foi possível restabelecer a conexão de vídeo com um participante.');
+          } else {
+            schedulePeerRecoveryRef.current(peerId);
+          }
+        });
+      }
+    }, delay);
+    recoveryTimers.current.set(peerId, timer);
+  }, [closePeer, createPeer]);
+  schedulePeerRecoveryRef.current = schedulePeerRecovery;
 
   const flushCandidates = useCallback(async (peerId: string, pc: RTCPeerConnection) => {
     const candidates = pendingCandidates.current.get(peerId) || [];
@@ -345,6 +504,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     });
     socket.on('participant:left', ({ participantId }: { participantId: string }) => {
       setParticipants((current) => current.filter((person) => person.id !== participantId));
+      recoveryAttempts.current.delete(participantId);
       closePeer(participantId);
     });
     socket.on('stream:started', ({ participantId, audioSource: incomingAudioSource }: ShareStarted) => {
@@ -374,6 +534,11 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       }
     });
     socket.on('rtc:signal', (signal: PeerSignal) => void handleSignal(signal));
+    socket.on('rtc:restart-request', ({ from }: { from: string }) => {
+      if (from && localStreamRef.current && selfIdRef.current === sharerIdRef.current) {
+        schedulePeerRecoveryRef.current(from);
+      }
+    });
 
     socket.connect();
     return () => {
@@ -386,6 +551,144 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       stopLocalTracks();
     };
   }, [closeAllPeers, closePeer, handleSignal, join, negotiateWith, roomId, stopLocalTracks]);
+
+  useEffect(() => {
+    if (!joined || (!localSharing && !DEBUG_WEBRTC)) {
+      setPeerDiagnostics([]);
+      previousPeerCounters.current.clear();
+      return;
+    }
+
+    let cancelled = false;
+    let polling = false;
+    const pollStats = async () => {
+      if (polling || cancelled) return;
+      polling = true;
+      const rows: PeerDiagnostic[] = [];
+      try {
+        const peers = [...peerConnections.current.entries()];
+        await Promise.all(peers.map(async ([peerId, pc]) => {
+          if (pc.connectionState === 'closed') return;
+          try {
+            const report = await pc.getStats();
+            const stats = [...report.values()] as WebRtcStatsItem[];
+            const outbound = stats.filter((stat) => stat.type === 'outbound-rtp');
+            const inbound = stats.filter((stat) => stat.type === 'inbound-rtp');
+            const outboundVideo = outbound.find((stat) => stringStat(stat, 'kind') === 'video' || stringStat(stat, 'mediaType') === 'video');
+            const inboundVideo = inbound.find((stat) => stringStat(stat, 'kind') === 'video' || stringStat(stat, 'mediaType') === 'video');
+            const remoteInbound = stats.find((stat) => stat.type === 'remote-inbound-rtp' && (stringStat(stat, 'kind') === 'video' || stringStat(stat, 'mediaType') === 'video'));
+            const totalBytesSent = outbound.reduce((total, stat) => total + (numberStat(stat, 'bytesSent') || 0), 0);
+            const totalBytesReceived = inbound.reduce((total, stat) => total + (numberStat(stat, 'bytesReceived') || 0), 0);
+            const now = performance.now();
+            const previous = previousPeerCounters.current.get(peerId);
+            const seconds = previous ? Math.max(0.001, (now - previous.sampledAt) / 1000) : 0;
+            const sentBitrate = previous ? Math.round(((totalBytesSent - previous.bytesSent) * 8) / seconds) : 0;
+            const receivedBitrate = previous ? Math.round(((totalBytesReceived - previous.bytesReceived) * 8) / seconds) : 0;
+            previousPeerCounters.current.set(peerId, { sampledAt: now, bytesSent: totalBytesSent, bytesReceived: totalBytesReceived });
+
+            const selectedPairId = stats.find((stat) => stat.type === 'transport' && stringStat(stat, 'selectedCandidatePairId'));
+            const selectedPair = (selectedPairId && stats.find((stat) => stat.id === stringStat(selectedPairId, 'selectedCandidatePairId')))
+              || stats.find((stat) => stat.type === 'candidate-pair' && stat.selected === true)
+              || stats.find((stat) => stat.type === 'candidate-pair' && stat.state === 'succeeded' && stat.nominated === true);
+            const availableOutgoingBitrate = numberStat(selectedPair, 'availableOutgoingBitrate');
+            const roundTripTime = numberStat(remoteInbound, 'roundTripTime') ?? numberStat(selectedPair, 'currentRoundTripTime');
+            const jitter = numberStat(inboundVideo, 'jitter') ?? numberStat(inbound[0], 'jitter');
+            const lost = numberStat(remoteInbound, 'packetsLost') ?? numberStat(inboundVideo, 'packetsLost');
+            const received = numberStat(remoteInbound, 'packetsReceived') ?? numberStat(inboundVideo, 'packetsReceived');
+            const packetLoss = numberStat(remoteInbound, 'fractionLost')
+              ?? (lost !== undefined && received !== undefined && lost + received > 0 ? lost / (lost + received) : undefined);
+            const codecId = stringStat(outboundVideo, 'codecId') ?? stringStat(inboundVideo, 'codecId');
+            const codecStat = codecId ? stats.find((stat) => stat.id === codecId) : undefined;
+            const framesEncoded = numberStat(outboundVideo, 'framesEncoded');
+            const totalEncodeTime = numberStat(outboundVideo, 'totalEncodeTime');
+            const qualityState = adaptiveQuality.current.get(peerId) || { level: 0, healthySamples: 0 };
+            const diagnostic: PeerDiagnostic = {
+              peerId,
+              connectionState: pc.connectionState,
+              iceState: pc.iceConnectionState,
+              sentBitrate,
+              receivedBitrate,
+              availableOutgoingBitrate,
+              roundTripTime,
+              jitter,
+              packetLoss,
+              fps: numberStat(outboundVideo, 'framesPerSecond') ?? numberStat(inboundVideo, 'framesPerSecond'),
+              width: numberStat(outboundVideo, 'frameWidth') ?? numberStat(inboundVideo, 'frameWidth'),
+              height: numberStat(outboundVideo, 'frameHeight') ?? numberStat(inboundVideo, 'frameHeight'),
+              framesSent: numberStat(outboundVideo, 'framesSent'),
+              framesLost: numberStat(inboundVideo, 'framesLost'),
+              framesDecoded: numberStat(inboundVideo, 'framesDecoded'),
+              framesDropped: numberStat(inboundVideo, 'framesDropped'),
+              codec: stringStat(codecStat, 'mimeType'),
+              encoder: stringStat(outboundVideo, 'encoderImplementation'),
+              encodeMillisecondsPerFrame: framesEncoded && totalEncodeTime ? (totalEncodeTime / framesEncoded) * 1000 : undefined,
+              qualityReason: stringStat(outboundVideo, 'qualityLimitationReason'),
+              adaptationLevel: qualityState.level,
+              bitrateLimit: qualityState.appliedBitrate,
+            };
+
+            const videoSender = localSharing ? pc.getSenders().find((sender) => sender.track?.kind === 'video') : undefined;
+            if (videoSender && outboundVideo) {
+              const activeState = adaptiveQuality.current.get(peerId) || { level: 0, healthySamples: 0 };
+              const reason = diagnostic.qualityReason;
+              const congested = (packetLoss !== undefined && packetLoss >= 0.06)
+                || (roundTripTime !== undefined && roundTripTime > 0.45)
+                || (jitter !== undefined && jitter > 0.08)
+                || (availableOutgoingBitrate !== undefined && availableOutgoingBitrate < (activeState.appliedBitrate || 800_000) * 0.7)
+                || reason === 'cpu'
+                || reason === 'bandwidth';
+              if (congested) {
+                activeState.level = Math.min(ADAPTATION_LEVELS.length - 1, activeState.level + 1);
+                activeState.healthySamples = 0;
+              } else if (activeState.level > 0) {
+                activeState.healthySamples += 1;
+                if (activeState.healthySamples >= 5) {
+                  activeState.level -= 1;
+                  activeState.healthySamples = 0;
+                }
+              }
+
+              const profile = ADAPTATION_LEVELS[activeState.level];
+              const recipientCount = Math.max(1, participantsRef.current.filter((person) => person.id !== selfIdRef.current).length);
+              const fairShare = initialVideoBitrateForMesh(recipientCount);
+              const pathLimit = availableOutgoingBitrate === undefined ? MAX_PEER_VIDEO_BITRATE : Math.max(MIN_PEER_VIDEO_BITRATE, availableOutgoingBitrate * 0.8);
+              const targetBitrate = Math.max(MIN_PEER_VIDEO_BITRATE, Math.floor(Math.min(fairShare, MAX_PEER_VIDEO_BITRATE, pathLimit) * profile.factor));
+              const changed = activeState.appliedBitrate === undefined
+                || Math.abs(targetBitrate - activeState.appliedBitrate) / activeState.appliedBitrate > 0.1
+                || activeState.appliedFramerate !== profile.framerate
+                || activeState.appliedScale !== profile.scale;
+              if (changed) {
+                try {
+                  await applyVideoSenderProfile(videoSender, targetBitrate, profile.framerate, profile.scale);
+                  activeState.appliedBitrate = targetBitrate;
+                  activeState.appliedFramerate = profile.framerate;
+                  activeState.appliedScale = profile.scale;
+                } catch {
+                  // Leave codec selection and congestion control to the browser if sender limits are unavailable.
+                }
+              }
+              adaptiveQuality.current.set(peerId, activeState);
+              diagnostic.adaptationLevel = activeState.level;
+              diagnostic.bitrateLimit = activeState.appliedBitrate;
+            }
+            rows.push(diagnostic);
+          } catch {
+            // A peer can close while getStats is being collected; the next poll will drop it.
+          }
+        }));
+        if (!cancelled && DEBUG_WEBRTC) setPeerDiagnostics(rows.sort((a, b) => a.peerId.localeCompare(b.peerId)));
+      } finally {
+        polling = false;
+      }
+    };
+
+    void pollStats();
+    const timer = window.setInterval(() => void pollStats(), 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [joined, localSharing]);
 
   function enter(event: FormEvent) {
     event.preventDefault();
@@ -415,7 +718,11 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     let stream: MediaStream;
     try {
       const options = {
-        video: true,
+        video: {
+          width: { ideal: 1280, max: 1920 },
+          height: { ideal: 720, max: 1080 },
+          frameRate: { ideal: CAPTURE_FRAME_RATE, max: CAPTURE_FRAME_RATE },
+        },
         audio: true,
         systemAudio: 'include',
         windowAudio: 'window',
@@ -580,6 +887,33 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
                 </div>
               )}
             </section>
+
+            {DEBUG_WEBRTC && (
+              <section className="webrtc-debug" aria-label="Diagnóstico WebRTC">
+                <div className="webrtc-debug-heading">
+                  <strong>Diagnóstico WebRTC</strong>
+                  <span>{peerConnections.current.size} conexão(ões) · amostra a cada 2 s</span>
+                </div>
+                {peerDiagnostics.length === 0 ? (
+                  <p>Nenhuma conexão de mídia ativa para medir.</p>
+                ) : peerDiagnostics.map((peer) => {
+                  const person = participants.find((participant) => participant.id === peer.peerId);
+                  return (
+                    <div className="webrtc-peer" key={peer.peerId}>
+                      <strong>{person?.name || peer.peerId.slice(0, 8)}</strong>
+                      <span>PC {peer.connectionState} · ICE {peer.iceState}</span>
+                      <span>TX {Math.round(peer.sentBitrate / 1000)} kbps · RX {Math.round(peer.receivedBitrate / 1000)} kbps</span>
+                      <span>Disponível {peer.availableOutgoingBitrate === undefined ? '—' : `${Math.round(peer.availableOutgoingBitrate / 1000)} kbps`}</span>
+                      <span>RTT {peer.roundTripTime === undefined ? '—' : `${Math.round(peer.roundTripTime * 1000)} ms`} · jitter {peer.jitter === undefined ? '—' : `${Math.round(peer.jitter * 1000)} ms`}</span>
+                      <span>Perda {peer.packetLoss === undefined ? '—' : `${(peer.packetLoss * 100).toFixed(1)}%`} · FPS {peer.fps === undefined ? '—' : Math.round(peer.fps)}</span>
+                      <span>{peer.width && peer.height ? `${peer.width}×${peer.height}` : 'Resolução —'} · quadros enviados/perdidos/decodificados/descartados {peer.framesSent ?? '—'}/{peer.framesLost ?? '—'}/{peer.framesDecoded ?? '—'}/{peer.framesDropped ?? '—'}</span>
+                      <span>Codec {peer.codec || '—'} · encoder {peer.encoder || '—'} · encode {peer.encodeMillisecondsPerFrame === undefined ? '—' : `${peer.encodeMillisecondsPerFrame.toFixed(1)} ms/quadro`}</span>
+                      <span>Limite {peer.bitrateLimit === undefined ? '—' : `${Math.round(peer.bitrateLimit / 1000)} kbps`} · adaptação {peer.adaptationLevel ?? 0}/3 · motivo {peer.qualityReason || '—'}</span>
+                    </div>
+                  );
+                })}
+              </section>
+            )}
 
             <section className="people-strip">
               <div className="people-title"><Icon name="users" /><h2>Na sala</h2><span>{participants.length}<b>/20</b></span></div>

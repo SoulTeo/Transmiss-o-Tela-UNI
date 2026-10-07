@@ -8,6 +8,7 @@
 .room-label,.divider,.connection-pill{color:#9ca3b1}
 .privacy-note{color:#9ca3b1}.privacy-note svg{color:#9b86ff;flex:none}
 .playback-button{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);min-height:44px;padding:0 17px;border:1px solid #ffffff35;border-radius:10px;background:#25213f;color:#fff;font-weight:700;font-size:12px;box-shadow:0 8px 28px #0008}.playback-button:hover{background:#342b56}.playback-button:focus-visible{outline:2px solid #c0b2ff;outline-offset:3px}
+.webrtc-debug{margin:13px 0;padding:13px 15px;background:#151922;border:1px solid #303748;border-radius:10px;color:#c8ceda;font:10px/1.55 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.webrtc-debug-heading{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px;color:#a995ff}.webrtc-debug-heading span{color:#9ca3b1}.webrtc-debug p{margin:0;color:#9ca3b1}.webrtc-peer{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:2px 13px;padding:8px 0;border-top:1px solid #29303d}.webrtc-peer strong{color:#f2f3f7}
 :focus-visible{outline:2px solid #b9a9ff;outline-offset:3px}
 button:focus:not(:focus-visible){outline:none}
 ::selection{color:#fff;background:#6645df}
