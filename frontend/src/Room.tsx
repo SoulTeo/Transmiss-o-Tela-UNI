@@ -321,14 +321,24 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
         if (event.candidate) sendSignal(peerId, { type: 'candidate', value: event.candidate.toJSON() });
       };
       pc.ontrack = (event) => {
-        const remoteStream = event.streams[0] || new MediaStream([event.track]);
         const video = remoteVideoRef.current;
-        if (!video) return;
+        const remoteStream = event.streams[0] || new MediaStream();
+        if (!remoteStream.getTracks().some((track) => track.id === event.track.id)) {
+          remoteStream.addTrack(event.track);
+        }
 
-        video.muted = true;
-        video.srcObject = remoteStream;
+        if (event.track.kind === 'video' && video) {
+          video.muted = true;
+          video.srcObject = remoteStream;
+          void video.play().catch(() => setPlaybackBlocked(true));
+        }
+
         const updateAudio = () => {
-          const liveAudioTracks = remoteStream.getAudioTracks().filter((track) => track.readyState === 'live');
+          // Use receiver tracks rather than relying on RTCTrackEvent.streams to
+          // contain both media kinds; some browsers emit an empty/separate stream.
+          const liveAudioTracks = pc.getReceivers()
+            .map((receiver) => receiver.track)
+            .filter((track) => track.kind === 'audio' && track.readyState === 'live');
           const audio = remoteAudioRef.current;
           setRemoteHasAudio(liveAudioTracks.length > 0);
           if (!audio) return;
@@ -342,10 +352,9 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
           }
         };
         updateAudio();
-        remoteStream.addEventListener('addtrack', updateAudio);
-        remoteStream.addEventListener('removetrack', updateAudio);
         event.track.addEventListener('ended', updateAudio, { once: true });
-        void video.play().catch(() => setPlaybackBlocked(true));
+        event.track.addEventListener('mute', updateAudio);
+        event.track.addEventListener('unmute', updateAudio);
       };
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') {
