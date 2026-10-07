@@ -86,15 +86,18 @@ async function applyVideoSenderProfile(sender: RTCRtpSender, bitrate: number, fr
 }
 
 function normalizedAudioTrackLabel(track: MediaStreamTrack) {
-  return track.label.trim().toLocaleLowerCase();
+  return track.label.trim().toLocaleLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
 function isApplicationAudioTrack(track: MediaStreamTrack) {
-  return ['application audio', 'áudio do aplicativo', 'áudio da aplicação'].includes(normalizedAudioTrackLabel(track));
+  const label = normalizedAudioTrackLabel(track);
+  if (isSystemAudioTrack(track)) return false;
+  return /(?:application|app|window|janela|aplicativo|aplicacao).*(?:audio|sound|som)|(?:audio|sound|som).*(?:application|app|window|janela|aplicativo|aplicacao)/.test(label);
 }
 
 function isSystemAudioTrack(track: MediaStreamTrack) {
-  return ['system audio', 'áudio do sistema'].includes(normalizedAudioTrackLabel(track));
+  const label = normalizedAudioTrackLabel(track);
+  return /system audio|desktop audio|audio do sistema|audio do computador|som do sistema|som do computador|audio geral/.test(label);
 }
 
 function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
@@ -120,16 +123,18 @@ function prepareCaptureAudio(stream: MediaStream) {
   } else if (surface === 'window') {
     const isolatedWindowAudio = liveAudioTracks.filter(isApplicationAudioTrack);
     discardAudioTracks(stream, audioTracks.filter((track) => !isolatedWindowAudio.includes(track)));
+    const audioTrackLabel = liveAudioTracks.map((track) => track.label.trim()).filter(Boolean).join(', ');
 
     if (isolatedWindowAudio.length > 0) {
       audioSource = 'window';
-      message = 'Áudio identificado como específico do aplicativo associado à janela selecionada incluído. O navegador pode capturar outras janelas do mesmo aplicativo.';
+      const acceptedLabels = isolatedWindowAudio.map((track) => track.label.trim()).filter(Boolean).join(', ');
+      message = `Áudio da janela recebido${acceptedLabels ? ` (${acceptedLabels})` : ''}. O navegador pode capturar outras janelas do mesmo aplicativo.`;
     } else if (liveAudioTracks.some(isSystemAudioTrack)) {
-      message = 'O navegador forneceu áudio do sistema inteiro para esta janela. Essa faixa foi bloqueada para não transmitir sons de outros aplicativos; a janela seguirá sem áudio.';
+      message = `O navegador forneceu “${audioTrackLabel || 'áudio do sistema'}” para esta janela. Essa faixa foi bloqueada para não transmitir sons de outros aplicativos; a janela seguirá sem áudio.`;
     } else if (liveAudioTracks.length > 0) {
-      message = 'O navegador não confirmou que a faixa pertence somente à janela selecionada. Ela foi bloqueada por segurança; a janela seguirá sem áudio.';
+      message = `O navegador forneceu uma faixa${audioTrackLabel ? ` (“${audioTrackLabel}”)` : ''}, mas não identificou que ela pertence à janela. Ela foi bloqueada por segurança; a janela seguirá sem áudio.`;
     } else {
-      message = 'O navegador não disponibilizou áudio isolado para esta janela. A janela seguirá sem áudio, sem captar o áudio geral do computador.';
+      message = 'O navegador não disponibilizou uma faixa de áudio isolada para esta janela. Confira se a opção de compartilhar áudio da janela está marcada no seletor do navegador e se o Edge/Chrome está atualizado; áudio do sistema inteiro continuará bloqueado neste modo.';
     }
   } else if (liveAudioTracks.length > 0) {
     audioSource = surface === 'monitor' ? 'system' : 'tab';
