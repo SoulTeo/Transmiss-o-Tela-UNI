@@ -156,7 +156,7 @@ function describeAudioSource(source: ShareAudioSource | null) {
   }
 }
 
-function Icon({ name }: { name: 'screen' | 'copy' | 'leave' | 'sound' | 'users' | 'lock' | 'spark' }) {
+function Icon({ name }: { name: 'screen' | 'copy' | 'leave' | 'sound' | 'users' | 'lock' | 'spark' | 'fullscreen' | 'exitFullscreen' }) {
   const common = { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true as const };
   if (name === 'screen') return <svg {...common}><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>;
   if (name === 'copy') return <svg {...common}><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>;
@@ -164,6 +164,8 @@ function Icon({ name }: { name: 'screen' | 'copy' | 'leave' | 'sound' | 'users' 
   if (name === 'sound') return <svg {...common}><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>;
   if (name === 'lock') return <svg {...common}><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3M12 14v3"/></svg>;
   if (name === 'spark') return <svg {...common}><path d="M12 2v20M2 12h20M4.93 4.93l14.14 14.14M19.07 4.93 4.93 19.07"/></svg>;
+  if (name === 'fullscreen') return <svg {...common}><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>;
+  if (name === 'exitFullscreen') return <svg {...common}><path d="M8 3v3a2 2 0 0 1-2 2H3M16 3v3a2 2 0 0 0 2 2h3M21 16h-3a2 2 0 0 0-2 2v3M3 16h3a2 2 0 0 1 2 2v3"/></svg>;
   return <svg {...common}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>;
 }
 
@@ -184,13 +186,16 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [playbackBlocked, setPlaybackBlocked] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [peerDiagnostics, setPeerDiagnostics] = useState<PeerDiagnostic[]>([]);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
   const nameRef = useRef(name);
   const selfIdRef = useRef('');
   const sharerIdRef = useRef<string | null>(null);
+  const audioEnabledRef = useRef(audioEnabled);
   nameRef.current = name;
   sharerIdRef.current = sharerId;
+  audioEnabledRef.current = audioEnabled;
   const mountedRef = useRef(true);
   const joinedRef = useRef(false);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -206,10 +211,18 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const participantsRef = useRef(participants);
   participantsRef.current = participants;
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const stageRef = useRef<HTMLElement | null>(null);
 
   const sharer = useMemo(() => participants.find((person) => person.id === sharerId), [participants, sharerId]);
   const isSharing = joined && localSharing;
   const shareUrl = `${window.location.origin}${roomPath(roomId)}`;
+
+  useEffect(() => {
+    const updateFullscreenState = () => setIsFullscreen(document.fullscreenElement === stageRef.current);
+    document.addEventListener('fullscreenchange', updateFullscreenState);
+    return () => document.removeEventListener('fullscreenchange', updateFullscreenState);
+  }, []);
 
   const closePeer = useCallback((peerId: string, clearCandidates = true) => {
     peerEpochs.current.set(peerId, (peerEpochs.current.get(peerId) || 0) + 1);
@@ -253,6 +266,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     closeAllPeers();
     stopLocalTracks();
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
     setParticipants([]);
     setJoined(false);
     setSharerId(null);
@@ -283,19 +297,31 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
         if (event.candidate) sendSignal(peerId, { type: 'candidate', value: event.candidate.toJSON() });
       };
       pc.ontrack = (event) => {
-        const [remoteStream] = event.streams;
-        if (remoteVideoRef.current && remoteStream) {
-          remoteVideoRef.current.srcObject = remoteStream;
-          const updateAudio = () => setRemoteHasAudio(remoteStream.getAudioTracks().some((track) => track.readyState === 'live'));
-          updateAudio();
-          remoteStream.addEventListener('addtrack', updateAudio);
-          remoteStream.addEventListener('removetrack', updateAudio);
-          event.track.addEventListener('ended', updateAudio, { once: true });
-          void remoteVideoRef.current.play().then(
-            () => setPlaybackBlocked(false),
-            () => setPlaybackBlocked(true),
-          );
-        }
+        const remoteStream = event.streams[0] || new MediaStream([event.track]);
+        const video = remoteVideoRef.current;
+        if (!video) return;
+
+        video.muted = true;
+        video.srcObject = remoteStream;
+        const updateAudio = () => {
+          const liveAudioTracks = remoteStream.getAudioTracks().filter((track) => track.readyState === 'live');
+          const audio = remoteAudioRef.current;
+          setRemoteHasAudio(liveAudioTracks.length > 0);
+          if (!audio) return;
+          audio.srcObject = liveAudioTracks.length > 0 ? new MediaStream(liveAudioTracks) : null;
+          if (liveAudioTracks.length > 0 && audioEnabledRef.current) {
+            audio.muted = false;
+            void audio.play().then(
+              () => setPlaybackBlocked(false),
+              () => setPlaybackBlocked(true),
+            );
+          }
+        };
+        updateAudio();
+        remoteStream.addEventListener('addtrack', updateAudio);
+        remoteStream.addEventListener('removetrack', updateAudio);
+        event.track.addEventListener('ended', updateAudio, { once: true });
+        void video.play().catch(() => setPlaybackBlocked(true));
       };
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') {
@@ -516,6 +542,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       if (participantId !== selfIdRef.current) {
         closeAllPeers();
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+        if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
       }
     });
     socket.on('stream:stopped', ({ participantId }: { participantId: string }) => {
@@ -531,6 +558,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       } else {
         closePeer(participantId);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+        if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
       }
     });
     socket.on('rtc:signal', (signal: PeerSignal) => void handleSignal(signal));
@@ -795,12 +823,13 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
 
   function toggleAudio() {
     const nextEnabled = !audioEnabled;
+    audioEnabledRef.current = nextEnabled;
     setAudioEnabled(nextEnabled);
-    const video = remoteVideoRef.current;
-    if (!video) return;
-    video.muted = !nextEnabled;
+    const audio = remoteAudioRef.current;
+    if (!audio) return;
+    audio.muted = !nextEnabled;
     if (nextEnabled) {
-      void video.play().then(
+      void audio.play().then(
         () => setPlaybackBlocked(false),
         () => setPlaybackBlocked(true),
       );
@@ -809,13 +838,37 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
 
   function unlockPlayback() {
     const video = remoteVideoRef.current;
+    const audio = remoteAudioRef.current;
     if (!video) return;
+    audioEnabledRef.current = true;
     setAudioEnabled(true);
-    video.muted = false;
-    void video.play().then(
-      () => setPlaybackBlocked(false),
-      () => setPlaybackBlocked(true),
-    );
+    video.muted = true;
+    if (audio && remoteHasAudio) {
+      audio.muted = false;
+      void Promise.all([video.play(), audio.play()]).then(
+        () => setPlaybackBlocked(false),
+        () => setPlaybackBlocked(true),
+      );
+    } else {
+      void video.play().then(
+        () => setPlaybackBlocked(false),
+        () => setPlaybackBlocked(true),
+      );
+    }
+  }
+
+  async function toggleFullscreen() {
+    const stage = stageRef.current;
+    if (!stage) return;
+    try {
+      if (document.fullscreenElement === stage) {
+        await document.exitFullscreen();
+      } else {
+        await stage.requestFullscreen();
+      }
+    } catch {
+      setError('Não foi possível abrir a transmissão em tela cheia neste navegador.');
+    }
   }
 
   return (
@@ -842,6 +895,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
           </button>
         </div>
       </header>
+      <audio ref={remoteAudioRef} className="remote-audio" autoPlay muted={!audioEnabled} aria-hidden="true" />
 
       <div className="room-content">
         {!joined ? (
@@ -863,14 +917,19 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
           <>
             {connectionLost && <div className="reconnect-banner"><span className="spinner" /> Conexão perdida. Tentando reconectar à sala…</div>}
             {error && <div className="room-error" role="alert"><span>{error}</span><button onClick={() => setError('')} aria-label="Fechar aviso">×</button></div>}
-            <section className={`stage ${sharerId ? 'stage-live' : ''}`}>
+            <section ref={stageRef} className={`stage ${sharerId ? 'stage-live' : ''}`}>
               {sharerId ? (
                 <>
-                  <video ref={remoteVideoRef} className="remote-video" autoPlay playsInline controls={false} muted={!audioEnabled || sharerId === selfId} />
+                  <video ref={remoteVideoRef} className="remote-video" autoPlay playsInline controls={false} muted />
                   {sharerId === selfId ? (
                     <div className="self-preview"><Icon name="screen" /><span>Sua tela está sendo compartilhada</span><small>Os participantes da sala podem assistir</small></div>
                   ) : (
-                    <div className="live-tag"><i /> AO VIVO</div>
+                    <>
+                      <div className="live-tag"><i /> AO VIVO</div>
+                      <button className="fullscreen-button" onClick={() => void toggleFullscreen()} aria-label={isFullscreen ? 'Sair da tela cheia' : 'Assistir em tela cheia'} title={isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}>
+                        <Icon name={isFullscreen ? 'exitFullscreen' : 'fullscreen'} /><span>{isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}</span>
+                      </button>
+                    </>
                   )}
                   {playbackBlocked && sharerId !== selfId && (
                     <button className="playback-button" onClick={unlockPlayback}>
