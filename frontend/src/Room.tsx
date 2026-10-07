@@ -100,6 +100,11 @@ function isSystemAudioTrack(track: MediaStreamTrack) {
   return /system audio|desktop audio|audio do sistema|audio do computador|som do sistema|som do computador|audio geral/.test(label);
 }
 
+function supportsChromiumWindowAudioPreference() {
+  const chromiumVersion = navigator.userAgent.match(/(?:Edg|Chrome)\/(\d+)/)?.[1];
+  return Number(chromiumVersion) >= 141;
+}
+
 function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
   for (const track of tracks) {
     stream.removeTrack(track);
@@ -122,14 +127,28 @@ function prepareCaptureAudio(stream: MediaStream) {
     message = 'Não foi possível identificar a origem da captura. A tela está sendo transmitida sem áudio por segurança.';
   } else if (surface === 'window') {
     const isolatedWindowAudio = liveAudioTracks.filter(isApplicationAudioTrack);
-    discardAudioTracks(stream, audioTracks.filter((track) => !isolatedWindowAudio.includes(track)));
     const audioTrackLabel = liveAudioTracks.map((track) => track.label.trim()).filter(Boolean).join(', ');
+    const hasSystemAudio = liveAudioTracks.some(isSystemAudioTrack);
+    // Chromium 141+ supports windowAudio:'window'. Some builds return a generic
+    // track label for app loopback; accept one such track only on those builds,
+    // while still rejecting a track explicitly identified as system audio.
+    const unclassifiedWindowAudio = isolatedWindowAudio.length === 0
+      && liveAudioTracks.length === 1
+      && !hasSystemAudio
+      && supportsChromiumWindowAudioPreference()
+      ? liveAudioTracks
+      : [];
+    const acceptedWindowAudio = isolatedWindowAudio.length > 0 ? isolatedWindowAudio : unclassifiedWindowAudio;
+    discardAudioTracks(stream, audioTracks.filter((track) => !acceptedWindowAudio.includes(track)));
 
     if (isolatedWindowAudio.length > 0) {
       audioSource = 'window';
       const acceptedLabels = isolatedWindowAudio.map((track) => track.label.trim()).filter(Boolean).join(', ');
       message = `Áudio da janela recebido${acceptedLabels ? ` (${acceptedLabels})` : ''}. O navegador pode capturar outras janelas do mesmo aplicativo.`;
-    } else if (liveAudioTracks.some(isSystemAudioTrack)) {
+    } else if (unclassifiedWindowAudio.length > 0) {
+      audioSource = 'window';
+      message = `O navegador entregou uma faixa de áudio para a janela${audioTrackLabel ? ` (“${audioTrackLabel}”)` : ''}. Ela foi encaminhada com a preferência windowAudio:"window"; o navegador não identificou a faixa pelo rótulo, então o isolamento depende do suporte dele.`;
+    } else if (hasSystemAudio) {
       message = `O navegador forneceu “${audioTrackLabel || 'áudio do sistema'}” para esta janela. Essa faixa foi bloqueada para não transmitir sons de outros aplicativos; a janela seguirá sem áudio.`;
     } else if (liveAudioTracks.length > 0) {
       message = `O navegador forneceu uma faixa${audioTrackLabel ? ` (“${audioTrackLabel}”)` : ''}, mas não identificou que ela pertence à janela. Ela foi bloqueada por segurança; a janela seguirá sem áudio.`;
