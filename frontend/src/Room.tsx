@@ -39,22 +39,20 @@ function prepareCaptureAudio(stream: MediaStream, capturedSurface?: ShareSurface
       ? 'Áudio fornecido pelo navegador; a origem não foi identificada.'
       : 'O navegador não disponibilizou áudio; a tela será transmitida sem áudio.';
   } else if (surface === 'window') {
-    const systemAudioTracks = liveAudioTracks.filter((track) => {
-      const deviceId = track.getSettings().deviceId?.toLowerCase() || '';
-      const label = track.label.toLowerCase();
-      return deviceId === 'loopback'
-        || /\b(system|desktop) audio\b|\bsystem sound\b|\bloopback\b/.test(label);
-    });
-    discardAudioTracks(stream, systemAudioTracks);
-    const windowAudioTracks = liveAudioTracks.filter((track) => !systemAudioTracks.includes(track));
-    if (windowAudioTracks.length > 0) {
+    if (liveAudioTracks.length > 0) {
       audioSource = 'window';
-      message = 'Áudio fornecido pelo navegador para a janela selecionada.';
+      const systemAudioWasReported = liveAudioTracks.some((track) => {
+        const deviceId = track.getSettings().deviceId?.toLowerCase() || '';
+        const label = track.label.toLowerCase();
+        return deviceId === 'loopback'
+          || /\b(system|desktop) audio\b|\bsystem sound\b|\bloopback\b/.test(label);
+      });
+      message = systemAudioWasReported
+        ? 'A faixa retornada para esta janela foi encaminhada. O navegador a identificou como áudio do sistema, então ela pode incluir sons de outros aplicativos.'
+        : 'A faixa de áudio retornada pelo navegador para esta janela foi encaminhada.';
     } else {
       audioSource = 'none';
-      message = systemAudioTracks.length > 0
-        ? 'O navegador só disponibilizou áudio geral do sistema para esta janela; ele foi omitido. O vídeo seguirá sem áudio.'
-        : 'O navegador não disponibilizou áudio para esta janela. O vídeo seguirá sem áudio.';
+      message = 'O navegador não retornou faixa de áudio para esta janela. O vídeo seguirá sem áudio.';
     }
   } else if (liveAudioTracks.length > 0) {
     audioSource = surface === 'monitor' ? 'system' : 'tab';
@@ -75,7 +73,7 @@ function describeAudioSource(source: ShareAudioSource | null) {
   switch (source) {
     case 'system': return 'Áudio do sistema inteiro incluído na transmissão.';
     case 'tab': return 'Somente o áudio da aba selecionada foi incluído.';
-    case 'window': return 'Áudio da janela fornecido pelo navegador.';
+    case 'window': return 'Áudio da janela encaminhado conforme a faixa fornecida pelo navegador.';
     case 'unknown': return 'Áudio fornecido pelo navegador; origem não identificada.';
     case 'none': return 'Esta origem não disponibilizou áudio isolado; a transmissão está sem áudio.';
     default: return 'O áudio depende da origem selecionada e do que o navegador disponibilizar.';
@@ -469,6 +467,16 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     }));
 
     const captureAudio = prepareCaptureAudio(stream, displaySurface);
+    console.info('[screen-share] faixas encaminhadas ao WebRTC', JSON.stringify({
+      audioSource: captureAudio.audioSource,
+      liveAudioTrackCount: stream.getAudioTracks().filter((track) => track.readyState === 'live').length,
+      audioTracks: stream.getAudioTracks().map((track) => ({
+        id: track.id,
+        readyState: track.readyState,
+        muted: track.muted,
+        enabled: track.enabled,
+      })),
+    }));
 
     setLocalAudioNotice(captureAudio.message);
     let captureEnded = videoTrack?.readyState === 'ended';
