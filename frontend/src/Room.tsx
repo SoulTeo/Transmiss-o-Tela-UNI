@@ -15,6 +15,80 @@ type ShareAudioSource = 'system' | 'tab' | 'window' | 'none';
 type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
 type ShareCaptureMode = 'window' | 'monitor';
 type ShareStarted = { participantId: string; audioSource: ShareAudioSource };
+type NativeAudioWindow = { handle: string; processId: number; title: string; processName: string };
+const nativeAudioBridgeUrl = 'http://localhost:17381';
+
+async function listNativeAudioWindows(): Promise<NativeAudioWindow[]> {
+  const response = await fetch(`${nativeAudioBridgeUrl}/api/windows`);
+  if (!response.ok) throw new Error('A ponte de áudio nativa não respondeu.');
+  return await response.json() as NativeAudioWindow[];
+}
+
+async function createNativeProcessAudioTrack(processId: number) {
+  const context = new AudioContext({ sampleRate: 48000 });
+  let socket: WebSocket | null = null;
+  let processor: AudioWorkletNode | null = null;
+  let destination: MediaStreamAudioDestinationNode | null = null;
+  let closed = false;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    socket?.close();
+    processor?.disconnect();
+    destination?.disconnect();
+    void context.close();
+  };
+
+  try {
+    const workletUrl = new URL(`${import.meta.env.BASE_URL}process-audio-worklet.js`, window.location.href).href;
+    await context.audioWorklet.addModule(workletUrl);
+    await context.resume();
+    processor = new AudioWorkletNode(context, 'process-audio-queue', {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+    });
+    destination = context.createMediaStreamDestination();
+    processor.connect(destination);
+    const track = destination.stream.getAudioTracks()[0];
+    socket = new WebSocket(`ws://localhost:17381/api/audio/${processId}`);
+    socket.binaryType = 'arraybuffer';
+
+    await new Promise<void>((resolve, reject) => {
+      let ready = false;
+      const timeout = window.setTimeout(() => reject(new Error('Tempo esgotado ao iniciar a captura de áudio do aplicativo.')), 8000);
+      socket!.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          if (event.data === 'ready') {
+            ready = true;
+            window.clearTimeout(timeout);
+            resolve();
+          } else if (event.data.startsWith('capture-error:')) {
+            window.clearTimeout(timeout);
+            reject(new Error(event.data.slice('capture-error:'.length)));
+          }
+          return;
+        }
+        if (event.data instanceof ArrayBuffer) processor?.port.postMessage(event.data, [event.data]);
+      };
+      socket!.onopen = () => undefined;
+      socket!.onerror = () => {
+        window.clearTimeout(timeout);
+        reject(new Error('Não foi possível conectar à captura nativa de áudio.'));
+      };
+      socket!.onclose = () => {
+        if (!ready) {
+          window.clearTimeout(timeout);
+          reject(new Error('A captura nativa de áudio foi encerrada antes de iniciar.'));
+        }
+      };
+    });
+    return { track, cleanup };
+  } catch (captureError) {
+    cleanup();
+    throw captureError;
+  }
+}
 
 function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
   for (const track of tracks) {
@@ -79,7 +153,7 @@ function describeAudioSource(source: ShareAudioSource | null) {
   switch (source) {
     case 'system': return 'Áudio do sistema inteiro incluído na transmissão.';
     case 'tab': return 'Somente o áudio da aba selecionada foi incluído.';
-    case 'window': return 'Faixa de áudio recebida junto com a captura da janela. O navegador não confirma que ela seja exclusiva dessa janela.';
+    case 'window': return 'Áudio do processo associado à janela selecionada.';
     case 'none': return 'Esta origem não disponibilizou áudio isolado; a transmissão está sem áudio.';
     default: return 'O áudio depende da origem selecionada e do que o navegador disponibilizar.';
   }
@@ -113,6 +187,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [playbackBlocked, setPlaybackBlocked] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [shareCaptureMode, setShareCaptureMode] = useState<ShareCaptureMode>('window');
+  const [audioWindowChoices, setAudioWindowChoices] = useState<NativeAudioWindow[] | null>(null);
 
   const socketRef = useRef<Socket | null>(null);
   const nameRef = useRef(name);
@@ -121,6 +196,8 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const mountedRef = useRef(true);
   const joinedRef = useRef(false);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const nativeAudioCleanupRef = useRef<(() => void) | null>(null);
+  const audioWindowChoiceRef = useRef<((window: NativeAudioWindow | null) => void) | null>(null);
   const peerConnections = useRef(new Map<string, RTCPeerConnection>());
   const peerCreations = useRef(new Map<string, Promise<RTCPeerConnection>>());
   const peerEpochs = useRef(new Map<string, number>());
@@ -156,9 +233,14 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     const stream = localStreamRef.current;
     if (stream) stream.getTracks().forEach((track) => track.stop());
     localStreamRef.current = null;
+    nativeAudioCleanupRef.current?.();
+    nativeAudioCleanupRef.current = null;
   }, []);
 
   const leaveRoom = useCallback(() => {
+    audioWindowChoiceRef.current?.(null);
+    audioWindowChoiceRef.current = null;
+    setAudioWindowChoices(null);
     const socket = socketRef.current;
     socket?.emit('room:leave', { roomId });
     socket?.disconnect();
@@ -416,6 +498,31 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     if (socket?.connected) join(socket);
   }
 
+  async function requestNativeAudioWindow(): Promise<NativeAudioWindow | null> {
+    let windows: NativeAudioWindow[];
+    try {
+      windows = await listNativeAudioWindows();
+    } catch {
+      setError('Para compartilhar o áudio isolado de uma janela, inicie a ponte nativa do Windows com “npm run dev:audio-bridge” na pasta do projeto e tente novamente.');
+      return null;
+    }
+    if (!windows.length) {
+      setError('O Windows não encontrou janelas abertas com título para capturar o áudio.');
+      return null;
+    }
+    setAudioWindowChoices(windows);
+    return await new Promise((resolve) => {
+      audioWindowChoiceRef.current = resolve;
+    });
+  }
+
+  function resolveAudioWindowChoice(choice: NativeAudioWindow | null) {
+    setAudioWindowChoices(null);
+    const resolve = audioWindowChoiceRef.current;
+    audioWindowChoiceRef.current = null;
+    resolve?.(choice);
+  }
+
   async function startSharing(captureMode: ShareCaptureMode) {
     setError('');
     if (!joined || !socketRef.current?.connected) {
@@ -446,8 +553,44 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       return;
     }
 
+    const videoTrack = stream.getVideoTracks()[0];
+    const displaySurface = videoTrack?.getSettings().displaySurface as ShareSurface | undefined;
+    let nativeAudioWindow: NativeAudioWindow | null = null;
+
+    if (captureMode === 'window' && displaySurface === 'monitor') {
+      stream.getTracks().forEach((track) => track.stop());
+      setError('Você selecionou uma tela inteira. Escolha “Tela inteira · áudio do sistema” ou volte e selecione uma janela/guia.');
+      return;
+    }
+    if (captureMode === 'monitor' && displaySurface !== 'monitor') {
+      stream.getTracks().forEach((track) => track.stop());
+      setError('Para transmitir o áudio geral do computador, selecione uma tela inteira no seletor do navegador.');
+      return;
+    }
+    if (displaySurface === 'window') {
+      // Do not mix the browser's system loopback into a window share. Obtain
+      // process-scoped audio from the local Windows bridge instead.
+      discardAudioTracks(stream, stream.getAudioTracks());
+      nativeAudioWindow = await requestNativeAudioWindow();
+      if (!nativeAudioWindow) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      try {
+        const nativeAudio = await createNativeProcessAudioTrack(nativeAudioWindow.processId);
+        stream.addTrack(nativeAudio.track);
+        nativeAudioCleanupRef.current = nativeAudio.cleanup;
+      } catch (captureError) {
+        stream.getTracks().forEach((track) => track.stop());
+        nativeAudioCleanupRef.current?.();
+        nativeAudioCleanupRef.current = null;
+        setError(`Não foi possível capturar o áudio de ${nativeAudioWindow.title}: ${captureError instanceof Error ? captureError.message : 'erro da captura nativa'}`);
+        return;
+      }
+    }
+
     console.info('[screen-share] getDisplayMedia retornou', JSON.stringify({
-      displaySurface: stream.getVideoTracks()[0]?.getSettings().displaySurface,
+      displaySurface,
       audioTracks: stream.getAudioTracks().map((track) => ({
         id: track.id,
         label: track.label,
@@ -458,16 +601,20 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     }));
 
     const captureAudio = prepareCaptureAudio(stream);
+    if (nativeAudioWindow) {
+      captureAudio.message = `Áudio isolado do processo ${nativeAudioWindow.processName} (${nativeAudioWindow.title}) incluído. Outras aplicações não entram nessa faixa.`;
+    }
     const hasLiveAudioTrack = stream.getAudioTracks().some((track) => track.readyState === 'live');
     if (captureAudio.audioSource === 'none' || !hasLiveAudioTrack) {
       stream.getTracks().forEach((track) => track.stop());
+      nativeAudioCleanupRef.current?.();
+      nativeAudioCleanupRef.current = null;
       setLocalAudioNotice('');
       setError(`${captureAudio.message} A transmissão não foi iniciada porque uma faixa de áudio é obrigatória. Escolha uma origem que disponibilize áudio e tente novamente.`);
       return;
     }
 
     setLocalAudioNotice(captureAudio.message);
-    const videoTrack = stream.getVideoTracks()[0];
     let captureEnded = videoTrack?.readyState === 'ended';
     videoTrack?.addEventListener('ended', () => {
       captureEnded = true;
@@ -484,6 +631,8 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     if (!result?.ok) {
       socketRef.current?.emit('stream:stop', { roomId });
       stream.getTracks().forEach((track) => track.stop());
+      nativeAudioCleanupRef.current?.();
+      nativeAudioCleanupRef.current = null;
       setLocalAudioNotice('');
       setError(result?.error || 'Outra pessoa já está compartilhando. Aguarde a transmissão terminar.');
       return;
@@ -573,6 +722,25 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
           </button>
         </div>
       </header>
+
+      {audioWindowChoices && (
+        <div className="native-audio-overlay">
+          <section className="native-audio-dialog" role="dialog" aria-modal="true" aria-labelledby="native-audio-title">
+            <h2 id="native-audio-title">Qual janela fornece o áudio?</h2>
+            <p>O navegador selecionou o vídeo. Agora escolha o mesmo aplicativo para capturar o áudio isolado desse processo.</p>
+            <p className="native-audio-caveat">O Windows separa áudio por processo. Se várias janelas do mesmo aplicativo compartilham o processo, o áudio delas também pode entrar.</p>
+            <div className="native-audio-list">
+              {audioWindowChoices.map((choice) => (
+                <button key={`${choice.handle}-${choice.processId}`} onClick={() => resolveAudioWindowChoice(choice)}>
+                  <strong>{choice.title}</strong>
+                  <small>{choice.processName} · processo {choice.processId}</small>
+                </button>
+              ))}
+            </div>
+            <button className="button button-secondary native-audio-cancel" onClick={() => resolveAudioWindowChoice(null)}>Cancelar compartilhamento</button>
+          </section>
+        </div>
+      )}
 
       <div className="room-content">
         {!joined ? (

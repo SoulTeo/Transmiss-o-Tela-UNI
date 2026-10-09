@@ -20,6 +20,14 @@ npm run dev:server
 npm run dev
 ```
 
+Para compartilhar áudio de uma janela específica no Windows, inicie também a ponte nativa em um terceiro terminal:
+
+```sh
+npm run dev:audio-bridge
+```
+
+O compartilhamento de janela abre primeiro o seletor de vídeo do navegador e depois pede que você escolha o processo correspondente para o áudio. A ponte usa captura WASAPI por processo; não encaminha o loopback geral do computador. Requer Windows 10 build 19041 ou posterior. O áudio pertence ao processo, então outras janelas do mesmo aplicativo/processo podem ser incluídas. A captura exata por HWND não é fornecida pelo Windows para aplicativos que misturam o áudio de suas janelas.
+
 Abra `http://localhost:5173`. Para usar outro backend, crie `frontend/.env.local` com `VITE_SIGNALING_URL=http://localhost:10000`. O padrão já usa o servidor local na porta 10000.
 
 ## Publicar o frontend no GitHub Pages
@@ -49,7 +57,7 @@ O projeto não fornece uma infraestrutura TURN hospedada. Para redes que bloquei
 - Apelidos limitados a 24 caracteres e eventos de sinalização validados no servidor.
 - Uma transmissão de tela por vez. Outras pessoas podem assistir; uma nova transmissão é recusada até a atual parar.
 - O botão muda para **Parar de compartilhar** durante a transmissão. Encerrar pela interface do navegador também encerra a transmissão na sala.
-- Tela inteira solicita o áudio do sistema; uma aba só envia a faixa de áudio daquela aba quando o navegador a fornece. Para janelas, o app pede `windowAudio: 'window'` e encaminha faixas cujo rótulo identifica áudio da aplicação/janela. Faixas identificadas como áudio do sistema ou com origem não confirmada são descartadas para impedir vazamento de sons de outros aplicativos. Alguns sistemas capturam o áudio no nível do processo/aplicativo, então outras janelas do mesmo aplicativo podem entrar na faixa; a API não garante isolamento por janela individual. Se nenhuma faixa chegar, o navegador/sistema não disponibilizou áudio isolado nessa captura.
+- Tela inteira solicita o áudio do sistema; uma aba só envia a faixa de áudio daquela aba quando o navegador a fornece. No Windows, compartilhar uma janela usa a ponte nativa WASAPI para capturar o processo escolhido, descartando qualquer faixa de loopback geral que o navegador tenha devolvido. É necessário manter `npm run dev:audio-bridge` ativo. A captura é por processo, não por HWND: outras janelas que compartilham o processo selecionado podem entrar no áudio.
 - A origem é identificada pela superfície reportada pelo navegador. Se a origem não puder ser identificada ou não houver uma faixa segura/separada, o vídeo segue sem áudio e a interface informa o motivo.
 - Se o navegador bloquear a reprodução automática, aparece o botão **Ativar áudio da transmissão** ou **Reproduzir transmissão**; é preciso clicar para liberar a reprodução.
 - Uma pessoa que entra durante uma transmissão recebe uma conexão WebRTC do participante que está compartilhando.
@@ -83,6 +91,7 @@ Esses cenários ainda precisam ser exercitados em computadores e conexões reais
 
 - Captura de tela requer HTTPS (ou `localhost`) e costuma estar disponível apenas em navegadores desktop. Celulares podem entrar e assistir, mas a captura pode não ser suportada pelo sistema/navegador.
 - Compartilhar áudio de tela varia por navegador, sistema operacional e origem selecionada na janela nativa de captura.
+- A captura nativa de áudio por processo funciona somente quando a ponte local está instalada e executando. O serviço desta versão aceita apenas `http://localhost:5173`; a versão publicada no GitHub Pages ainda precisa ser empacotada com uma aplicação desktop/ponte distribuível para oferecer áudio de janela.
 - O estado das salas não sobrevive ao reinício do backend.
 - A verificação em navegadores, redes distintas, celular, 20 participantes e TURN exige publicar/configurar a infraestrutura. O código inclui o suporte, mas não afirma que esses cenários foram exercitados neste ambiente.
 - Nomes não são autenticação; qualquer pessoa com o link pode entrar enquanto houver vaga.
