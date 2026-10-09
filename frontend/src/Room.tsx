@@ -13,6 +13,7 @@ type JoinResult = ServerAck<{
 type PeerSignal = { from: string; signal: { type: 'offer' | 'answer' | 'candidate'; value: RTCSessionDescriptionInit | RTCIceCandidateInit } };
 type ShareAudioSource = 'system' | 'tab' | 'window' | 'none';
 type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
+type ShareCaptureMode = 'window' | 'monitor';
 type ShareStarted = { participantId: string; audioSource: ShareAudioSource };
 
 function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
@@ -36,10 +37,25 @@ function prepareCaptureAudio(stream: MediaStream) {
     discardAudioTracks(stream, audioTracks);
     message = 'Não foi possível identificar a origem da captura. A tela está sendo transmitida sem áudio por segurança.';
   } else if (surface === 'window') {
-    if (liveAudioTracks.length > 0) {
+    // Chromium can expose the system output loopback for a window capture.
+    // That track contains unrelated apps, so never forward it as window audio.
+    // `windowAudio: 'window'` asks the browser for window-originating audio;
+    // MediaStreamTrack has no standardized source identifier beyond this
+    // Chromium loopback setting, so unknown tracks are left to the browser's
+    // implementation of that request.
+    const systemLoopbackTracks = liveAudioTracks.filter((track) =>
+      track.getSettings().deviceId?.toLowerCase() === 'loopback',
+    );
+    discardAudioTracks(stream, systemLoopbackTracks);
+    const windowAudioTracks = liveAudioTracks.filter((track) => !systemLoopbackTracks.includes(track));
+    if (windowAudioTracks.length > 0) {
       audioSource = 'window';
-      message = 'Faixa de áudio devolvida junto com a captura da janela encaminhada. O isolamento da origem depende de o navegador respeitar windowAudio:"window".';
+      message = 'Áudio da janela encaminhado conforme windowAudio:"window". O navegador não fornece uma identificação padronizada da origem da faixa.';
+    } else if (systemLoopbackTracks.length > 0) {
+      audioSource = 'none';
+      message = 'O navegador forneceu áudio de loopback do sistema inteiro para esta janela. Essa faixa foi removida para não incluir sons de outros aplicativos.';
     } else {
+      audioSource = 'none';
       message = 'O navegador não devolveu uma faixa de áudio para esta janela. A transmissão não será iniciada sem áudio.';
     }
   } else if (liveAudioTracks.length > 0) {
@@ -94,6 +110,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [remoteHasAudio, setRemoteHasAudio] = useState<boolean | null>(null);
   const [playbackBlocked, setPlaybackBlocked] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
+  const [shareCaptureMode, setShareCaptureMode] = useState<ShareCaptureMode>('window');
 
   const socketRef = useRef<Socket | null>(null);
   const nameRef = useRef(name);
@@ -397,7 +414,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     if (socket?.connected) join(socket);
   }
 
-  async function startSharing() {
+  async function startSharing(captureMode: ShareCaptureMode) {
     setError('');
     if (!joined || !socketRef.current?.connected) {
       setError('Aguarde a conexão com a sala antes de compartilhar.');
@@ -410,11 +427,16 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     let stream: MediaStream;
     try {
       const options = {
-        video: true,
+        video: { displaySurface: captureMode === 'window' ? 'window' : 'monitor' },
         audio: true,
-        systemAudio: 'include',
-        windowAudio: 'window',
-      } as DisplayMediaStreamOptions & { systemAudio: 'include'; windowAudio: 'window' };
+        systemAudio: captureMode === 'monitor' ? 'include' : 'exclude',
+        windowAudio: captureMode === 'window' ? 'window' : 'exclude',
+        monitorTypeSurfaces: captureMode === 'window' ? 'exclude' : 'include',
+      } as DisplayMediaStreamOptions & {
+        systemAudio: 'include' | 'exclude';
+        windowAudio: 'window' | 'exclude';
+        monitorTypeSurfaces: 'include' | 'exclude';
+      };
       stream = await navigator.mediaDevices.getDisplayMedia(options);
     } catch (captureError) {
       if (captureError instanceof DOMException && captureError.name === 'NotAllowedError') return;
@@ -616,9 +638,21 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
                 {isSharing ? (
                   <button className="button button-stop" onClick={() => void stopSharing()}><span className="stop-square" /> Parar de compartilhar</button>
                 ) : (
-                  <button className="button button-primary share-button" onClick={() => void startSharing()} disabled={Boolean(sharerId) || connectionLost} title={sharerId ? 'Aguarde a transmissão atual terminar' : undefined}>
-                    <Icon name="screen" /> Compartilhar tela
-                  </button>
+                  <>
+                    <select
+                      className="share-mode-select"
+                      aria-label="Origem do compartilhamento"
+                      value={shareCaptureMode}
+                      onChange={(event) => setShareCaptureMode(event.target.value as ShareCaptureMode)}
+                      disabled={Boolean(sharerId) || connectionLost}
+                    >
+                      <option value="window">Janela ou guia · áudio da origem</option>
+                      <option value="monitor">Tela inteira · áudio do sistema</option>
+                    </select>
+                    <button className="button button-primary share-button" onClick={() => void startSharing(shareCaptureMode)} disabled={Boolean(sharerId) || connectionLost} title={sharerId ? 'Aguarde a transmissão atual terminar' : undefined}>
+                      <Icon name="screen" /> Compartilhar tela
+                    </button>
+                  </>
                 )}
                 <button className="button button-leave" onClick={leaveRoom}><Icon name="leave" /> Sair</button>
               </div>
