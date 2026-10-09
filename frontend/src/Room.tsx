@@ -39,20 +39,22 @@ function prepareCaptureAudio(stream: MediaStream, capturedSurface?: ShareSurface
       ? 'Áudio fornecido pelo navegador; a origem não foi identificada.'
       : 'O navegador não disponibilizou áudio; a tela será transmitida sem áudio.';
   } else if (surface === 'window') {
-    if (liveAudioTracks.length > 0) {
+    const systemAudioTracks = liveAudioTracks.filter((track) => {
+      const deviceId = track.getSettings().deviceId?.toLowerCase() || '';
+      const label = track.label.toLowerCase();
+      return deviceId === 'loopback'
+        || /\b(system|desktop) audio\b|\bsystem sound\b|\bloopback\b/.test(label);
+    });
+    discardAudioTracks(stream, systemAudioTracks);
+    const windowAudioTracks = liveAudioTracks.filter((track) => !systemAudioTracks.includes(track));
+    if (windowAudioTracks.length > 0) {
       audioSource = 'window';
-      const systemAudioWasReported = liveAudioTracks.some((track) => {
-        const deviceId = track.getSettings().deviceId?.toLowerCase() || '';
-        const label = track.label.toLowerCase();
-        return deviceId === 'loopback'
-          || /\b(system|desktop) audio\b|\bsystem sound\b|\bloopback\b/.test(label);
-      });
-      message = systemAudioWasReported
-        ? 'A faixa retornada para esta janela foi encaminhada. O navegador a identificou como áudio do sistema, então ela pode incluir sons de outros aplicativos.'
-        : 'A faixa de áudio retornada pelo navegador para esta janela foi encaminhada.';
+      message = 'Áudio da janela fornecido pelo navegador foi encaminhado.';
     } else {
       audioSource = 'none';
-      message = 'O navegador não retornou faixa de áudio para esta janela. O vídeo seguirá sem áudio.';
+      message = systemAudioTracks.length > 0
+        ? 'O navegador devolveu áudio geral do sistema, que foi omitido. O vídeo da janela seguirá sem áudio.'
+        : 'O navegador não retornou faixa de áudio para esta janela. O vídeo seguirá sem áudio.';
     }
   } else if (liveAudioTracks.length > 0) {
     audioSource = surface === 'monitor' ? 'system' : 'tab';
@@ -424,11 +426,12 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       const options = {
         video: { cursor: 'never' },
         audio: true,
-        systemAudio: 'include',
+        // Offer audio from the selected tab/window, but never system loopback.
+        systemAudio: 'exclude',
         windowAudio: 'window',
       } as DisplayMediaStreamOptions & {
         video: MediaTrackConstraints & { cursor: 'never' };
-        systemAudio: 'include';
+        systemAudio: 'exclude';
         windowAudio: 'window';
       };
       stream = await navigator.mediaDevices.getDisplayMedia(options);

@@ -50,7 +50,7 @@ O projeto não fornece uma infraestrutura TURN hospedada. Para redes que bloquei
 - Uma transmissão de tela por vez. Outras pessoas podem assistir; uma nova transmissão é recusada até a atual parar.
 - O botão muda para **Parar de compartilhar** durante a transmissão. Encerrar pela interface do navegador também encerra a transmissão na sala.
 - O botão **Compartilhar tela** abre diretamente o seletor do navegador, que oferece as origens disponíveis no sistema. A aplicação solicita áudio da origem escolhida e mantém o vídeo mesmo quando o navegador não fornece uma faixa de áudio.
-- Guias usam a faixa de áudio da guia quando disponível; telas inteiras podem incluir o áudio do sistema. Para janelas, uma faixa explicitamente identificada como loopback geral é omitida para não misturar outros aplicativos. Quando o navegador não fornece áudio isolado da janela, o vídeo segue sem áudio e a interface informa o motivo.
+- Guias e janelas solicitam o áudio da origem selecionada; telas inteiras não oferecem loopback do sistema. Para janelas, uma faixa explicitamente identificada como loopback geral é omitida para não misturar outros aplicativos. Quando o navegador não fornece áudio isolado, o vídeo segue sem áudio e a interface informa o motivo.
 - Se o navegador bloquear a reprodução automática, aparece o botão **Ativar áudio da transmissão** ou **Reproduzir transmissão**; é preciso clicar para liberar a reprodução.
 - Uma pessoa que entra durante uma transmissão recebe uma conexão WebRTC do participante que está compartilhando.
 - Ao desconectar, o servidor remove a pessoa e atualiza a sala. O cliente tenta reconectar automaticamente.
@@ -77,7 +77,7 @@ Esses cenários ainda precisam ser exercitados em computadores e conexões reais
 2. Em um computador intermediário, compartilhe conteúdo com muito movimento e depois conteúdo estático; observe FPS, resolução, encode por quadro e `qualityLimitationReason`.
 3. Em um computador de menor capacidade, verifique o indicador `cpu`, quedas de FPS, estabilidade do áudio e uso de CPU/GPU/RAM no monitor do sistema.
 4. Repita com rede rápida, média e instável usando um limitador de tráfego no roteador ou no sistema operacional. Confira se os níveis de adaptação descem sob perda/RTT/jitter e sobem gradualmente após estabilização.
-5. Teste separadamente guia, janela e tela inteira com áudio, conferindo que guia e janela seguem as faixas disponíveis/seguras e que tela inteira pode transmitir o áudio do sistema. Registre também navegador, sistema operacional, codec/encoder reportados e quantidade de espectadores.
+5. Teste separadamente guia, janela e tela inteira, conferindo as faixas disponíveis. Sistema de áudio geral não é oferecido; guias e janelas podem fornecer áudio próprio conforme o navegador. Registre também navegador, sistema operacional, codec/encoder reportados e quantidade de espectadores.
 
 ## Limitações conhecidas
 
