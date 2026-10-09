@@ -97,8 +97,12 @@ function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
   }
 }
 
-function prepareCaptureAudio(stream: MediaStream) {
-  const displaySurface = stream.getVideoTracks()[0]?.getSettings().displaySurface as ShareSurface | undefined;
+function prepareCaptureAudio(
+  stream: MediaStream,
+  nativeWindowAudio = false,
+  capturedSurface?: ShareSurface,
+) {
+  const displaySurface = capturedSurface ?? stream.getVideoTracks()[0]?.getSettings().displaySurface as ShareSurface | undefined;
   const surface: ShareSurface = displaySurface === 'monitor' || displaySurface === 'browser' || displaySurface === 'window'
     ? displaySurface
     : 'unknown';
@@ -107,33 +111,24 @@ function prepareCaptureAudio(stream: MediaStream) {
   let audioSource: ShareAudioSource = 'none';
   let message = '';
 
+  // Trust the explicit capture path, not labels that WebAudio may assign to
+  // the native process-loopback track (for example "System Audio").
+  if (nativeWindowAudio && liveAudioTracks.length > 0) {
+    audioSource = 'window';
+    message = 'Áudio capturado pela ponte nativa a partir do processo escolhido.';
+    return { audioSource, message };
+  }
+
   if (surface === 'unknown') {
     discardAudioTracks(stream, audioTracks);
     message = 'Não foi possível identificar a origem da captura. A tela está sendo transmitida sem áudio por segurança.';
   } else if (surface === 'window') {
-    // A browser may return system loopback even for a window capture. Never
-    // forward a track that is explicitly identified as system/desktop audio.
-    // Labels are only one negative signal; they are not used to infer that an
-    // unknown track belongs to the selected window.
-    const systemAudioTracks = liveAudioTracks.filter((track) => {
-      const settings = track.getSettings();
-      const deviceId = settings.deviceId?.toLowerCase() || '';
-      const label = track.label.toLowerCase();
-      return deviceId === 'loopback'
-        || /\b(system|desktop) audio\b|\bsystem sound\b|\bloopback\b/.test(label);
-    });
-    discardAudioTracks(stream, systemAudioTracks);
-    const windowAudioTracks = liveAudioTracks.filter((track) => !systemAudioTracks.includes(track));
-    if (windowAudioTracks.length > 0) {
-      audioSource = 'window';
-      message = 'Áudio da janela encaminhado conforme windowAudio:"window". O navegador não fornece uma identificação padronizada da origem da faixa.';
-    } else if (systemAudioTracks.length > 0) {
-      audioSource = 'none';
-      message = 'O navegador forneceu áudio geral do sistema para esta janela. Essa faixa foi removida para não incluir sons de outros aplicativos; escolha uma janela/origem que disponibilize áudio próprio.';
-    } else {
-      audioSource = 'none';
-      message = 'O navegador não devolveu uma faixa de áudio para esta janela. A transmissão não será iniciada sem áudio.';
-    }
+    // A browser-provided track for a window is not guaranteed to be scoped
+    // to that window. Window capture must use the explicitly selected native
+    // process path above; never forward the browser's ambiguous loopback.
+    discardAudioTracks(stream, audioTracks);
+    audioSource = 'none';
+    message = 'A captura de áudio isolado da janela não foi iniciada pela ponte nativa. Reinicie o compartilhamento para escolher o processo da janela.';
   } else if (liveAudioTracks.length > 0) {
     audioSource = surface === 'monitor' ? 'system' : 'tab';
     message = audioSource === 'system'
@@ -557,6 +552,16 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     const displaySurface = videoTrack?.getSettings().displaySurface as ShareSurface | undefined;
     let nativeAudioWindow: NativeAudioWindow | null = null;
 
+    console.info('[screen-share] origem escolhida pelo navegador', JSON.stringify({
+      requestedMode: captureMode,
+      displaySurface: displaySurface ?? 'unreported',
+      browserAudioTrackCount: stream.getAudioTracks().length,
+      browserAudioTracks: stream.getAudioTracks().map((track) => ({
+        label: track.label,
+        settings: track.getSettings(),
+      })),
+    }));
+
     if (captureMode === 'window' && displaySurface === 'monitor') {
       stream.getTracks().forEach((track) => track.stop());
       setError('Você selecionou uma tela inteira. Escolha “Tela inteira · áudio do sistema” ou volte e selecione uma janela/guia.');
@@ -591,6 +596,9 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
 
     console.info('[screen-share] getDisplayMedia retornou', JSON.stringify({
       displaySurface,
+      audioCapturePath: nativeAudioWindow ? 'native-process' : 'browser-display-track',
+      nativeAudioProcessId: nativeAudioWindow?.processId,
+      nativeAudioProcessName: nativeAudioWindow?.processName,
       audioTracks: stream.getAudioTracks().map((track) => ({
         id: track.id,
         label: track.label,
@@ -600,7 +608,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       })),
     }));
 
-    const captureAudio = prepareCaptureAudio(stream);
+    const captureAudio = prepareCaptureAudio(stream, Boolean(nativeAudioWindow), displaySurface);
     if (nativeAudioWindow) {
       captureAudio.message = `Áudio isolado do processo ${nativeAudioWindow.processName} (${nativeAudioWindow.title}) incluído. Outras aplicações não entram nessa faixa.`;
     }
