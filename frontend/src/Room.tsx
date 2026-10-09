@@ -15,18 +15,6 @@ type ShareAudioSource = 'system' | 'tab' | 'window' | 'none';
 type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
 type ShareStarted = { participantId: string; audioSource: ShareAudioSource };
 
-function normalizedAudioTrackLabel(track: MediaStreamTrack) {
-  return track.label.trim().toLocaleLowerCase();
-}
-
-function isApplicationAudioTrack(track: MediaStreamTrack) {
-  return ['application audio', 'áudio do aplicativo', 'áudio da aplicação'].includes(normalizedAudioTrackLabel(track));
-}
-
-function isSystemAudioTrack(track: MediaStreamTrack) {
-  return ['system audio', 'áudio do sistema'].includes(normalizedAudioTrackLabel(track));
-}
-
 function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
   for (const track of tracks) {
     stream.removeTrack(track);
@@ -48,18 +36,11 @@ function prepareCaptureAudio(stream: MediaStream) {
     discardAudioTracks(stream, audioTracks);
     message = 'Não foi possível identificar a origem da captura. A tela está sendo transmitida sem áudio por segurança.';
   } else if (surface === 'window') {
-    const isolatedWindowAudio = liveAudioTracks.filter(isApplicationAudioTrack);
-    discardAudioTracks(stream, audioTracks.filter((track) => !isolatedWindowAudio.includes(track)));
-
-    if (isolatedWindowAudio.length > 0) {
+    if (liveAudioTracks.length > 0) {
       audioSource = 'window';
-      message = 'Áudio identificado como específico do aplicativo associado à janela selecionada incluído. O navegador pode capturar outras janelas do mesmo aplicativo.';
-    } else if (liveAudioTracks.some(isSystemAudioTrack)) {
-      message = 'O navegador forneceu áudio do sistema inteiro para esta janela. Essa faixa foi bloqueada para não transmitir sons de outros aplicativos; a janela seguirá sem áudio.';
-    } else if (liveAudioTracks.length > 0) {
-      message = 'O navegador não confirmou que a faixa pertence somente à janela selecionada. Ela foi bloqueada por segurança; a janela seguirá sem áudio.';
+      message = 'Faixa de áudio devolvida junto com a captura da janela encaminhada. O isolamento da origem depende de o navegador respeitar windowAudio:"window".';
     } else {
-      message = 'O navegador não disponibilizou áudio isolado para esta janela. A janela seguirá sem áudio, sem captar o áudio geral do computador.';
+      message = 'O navegador não devolveu uma faixa de áudio para esta janela. A transmissão não será iniciada sem áudio.';
     }
   } else if (liveAudioTracks.length > 0) {
     audioSource = surface === 'monitor' ? 'system' : 'tab';
@@ -125,6 +106,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const peerCreations = useRef(new Map<string, Promise<RTCPeerConnection>>());
   const peerEpochs = useRef(new Map<string, number>());
   const pendingCandidates = useRef(new Map<string, RTCIceCandidateInit[]>());
+  const remoteStreams = useRef(new Map<string, MediaStream>());
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
 
   const sharer = useMemo(() => participants.find((person) => person.id === sharerId), [participants, sharerId]);
@@ -134,6 +116,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const closePeer = useCallback((peerId: string, clearCandidates = true) => {
     peerEpochs.current.set(peerId, (peerEpochs.current.get(peerId) || 0) + 1);
     peerCreations.current.delete(peerId);
+    remoteStreams.current.delete(peerId);
     const pc = peerConnections.current.get(peerId);
     if (pc) {
       pc.onicecandidate = null;
@@ -195,19 +178,31 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
         if (event.candidate) sendSignal(peerId, { type: 'candidate', value: event.candidate.toJSON() });
       };
       pc.ontrack = (event) => {
-        const [remoteStream] = event.streams;
-        if (remoteVideoRef.current && remoteStream) {
-          remoteVideoRef.current.srcObject = remoteStream;
-          const updateAudio = () => setRemoteHasAudio(remoteStream.getAudioTracks().some((track) => track.readyState === 'live'));
-          updateAudio();
-          remoteStream.addEventListener('addtrack', updateAudio);
-          remoteStream.addEventListener('removetrack', updateAudio);
-          event.track.addEventListener('ended', updateAudio, { once: true });
-          void remoteVideoRef.current.play().then(
+        const remoteStream = remoteStreams.current.get(peerId) || new MediaStream();
+        remoteStreams.current.set(peerId, remoteStream);
+        const syncReceiverTracks = () => {
+          const receiverTracks = pc.getReceivers().map((receiver) => receiver.track)
+            .filter((track) => track.readyState === 'live');
+          if (event.track.readyState === 'live' && !receiverTracks.some((track) => track.id === event.track.id)) {
+            receiverTracks.push(event.track);
+          }
+          for (const track of receiverTracks) {
+            if (!remoteStream.getTracks().some((existing) => existing.id === track.id)) remoteStream.addTrack(track);
+          }
+          setRemoteHasAudio(receiverTracks.some((track) => track.kind === 'audio'));
+
+          const video = remoteVideoRef.current;
+          if (!video) return;
+          if (video.srcObject !== remoteStream) video.srcObject = remoteStream;
+          void video.play().then(
             () => setPlaybackBlocked(false),
             () => setPlaybackBlocked(true),
           );
-        }
+        };
+        syncReceiverTracks();
+        event.track.addEventListener('ended', syncReceiverTracks, { once: true });
+        event.track.addEventListener('mute', syncReceiverTracks);
+        event.track.addEventListener('unmute', syncReceiverTracks);
       };
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'failed' || pc.connectionState === 'closed') closePeer(peerId);
