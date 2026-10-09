@@ -428,6 +428,14 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     }
 
     const captureAudio = prepareCaptureAudio(stream);
+    const hasLiveAudioTrack = stream.getAudioTracks().some((track) => track.readyState === 'live');
+    if (captureAudio.audioSource === 'none' || !hasLiveAudioTrack) {
+      stream.getTracks().forEach((track) => track.stop());
+      setLocalAudioNotice('');
+      setError(`${captureAudio.message} A transmissão não foi iniciada porque uma faixa de áudio é obrigatória. Escolha uma origem que disponibilize áudio e tente novamente.`);
+      return;
+    }
+
     setLocalAudioNotice(captureAudio.message);
     const videoTrack = stream.getVideoTracks()[0];
     let captureEnded = videoTrack?.readyState === 'ended';
