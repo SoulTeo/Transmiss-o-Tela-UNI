@@ -61,7 +61,7 @@ function describeAudioSource(source: ShareAudioSource | null) {
   switch (source) {
     case 'system': return 'Áudio do sistema inteiro incluído na transmissão.';
     case 'tab': return 'Somente o áudio da aba selecionada foi incluído.';
-    case 'window': return 'Áudio específico do aplicativo associado à janela selecionada incluído; o navegador pode capturar outras janelas do mesmo aplicativo.';
+    case 'window': return 'Faixa de áudio recebida junto com a captura da janela. O navegador não confirma que ela seja exclusiva dessa janela.';
     case 'none': return 'Esta origem não disponibilizou áudio isolado; a transmissão está sem áudio.';
     default: return 'O áudio depende da origem selecionada e do que o navegador disponibilizar.';
   }
@@ -421,6 +421,17 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       setError('Não foi possível iniciar a captura. Verifique as permissões do navegador e tente novamente.');
       return;
     }
+
+    console.info('[screen-share] getDisplayMedia retornou', JSON.stringify({
+      displaySurface: stream.getVideoTracks()[0]?.getSettings().displaySurface,
+      audioTracks: stream.getAudioTracks().map((track) => ({
+        id: track.id,
+        label: track.label,
+        readyState: track.readyState,
+        muted: track.muted,
+        settings: track.getSettings(),
+      })),
+    }));
 
     const captureAudio = prepareCaptureAudio(stream);
     const hasLiveAudioTrack = stream.getAudioTracks().some((track) => track.readyState === 'live');
