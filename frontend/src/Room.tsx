@@ -37,23 +37,25 @@ function prepareCaptureAudio(stream: MediaStream) {
     discardAudioTracks(stream, audioTracks);
     message = 'Não foi possível identificar a origem da captura. A tela está sendo transmitida sem áudio por segurança.';
   } else if (surface === 'window') {
-    // Chromium can expose the system output loopback for a window capture.
-    // That track contains unrelated apps, so never forward it as window audio.
-    // `windowAudio: 'window'` asks the browser for window-originating audio;
-    // MediaStreamTrack has no standardized source identifier beyond this
-    // Chromium loopback setting, so unknown tracks are left to the browser's
-    // implementation of that request.
-    const systemLoopbackTracks = liveAudioTracks.filter((track) =>
-      track.getSettings().deviceId?.toLowerCase() === 'loopback',
-    );
-    discardAudioTracks(stream, systemLoopbackTracks);
-    const windowAudioTracks = liveAudioTracks.filter((track) => !systemLoopbackTracks.includes(track));
+    // A browser may return system loopback even for a window capture. Never
+    // forward a track that is explicitly identified as system/desktop audio.
+    // Labels are only one negative signal; they are not used to infer that an
+    // unknown track belongs to the selected window.
+    const systemAudioTracks = liveAudioTracks.filter((track) => {
+      const settings = track.getSettings();
+      const deviceId = settings.deviceId?.toLowerCase() || '';
+      const label = track.label.toLowerCase();
+      return deviceId === 'loopback'
+        || /\b(system|desktop) audio\b|\bsystem sound\b|\bloopback\b/.test(label);
+    });
+    discardAudioTracks(stream, systemAudioTracks);
+    const windowAudioTracks = liveAudioTracks.filter((track) => !systemAudioTracks.includes(track));
     if (windowAudioTracks.length > 0) {
       audioSource = 'window';
       message = 'Áudio da janela encaminhado conforme windowAudio:"window". O navegador não fornece uma identificação padronizada da origem da faixa.';
-    } else if (systemLoopbackTracks.length > 0) {
+    } else if (systemAudioTracks.length > 0) {
       audioSource = 'none';
-      message = 'O navegador forneceu áudio de loopback do sistema inteiro para esta janela. Essa faixa foi removida para não incluir sons de outros aplicativos.';
+      message = 'O navegador forneceu áudio geral do sistema para esta janela. Essa faixa foi removida para não incluir sons de outros aplicativos; escolha uma janela/origem que disponibilize áudio próprio.';
     } else {
       audioSource = 'none';
       message = 'O navegador não devolveu uma faixa de áudio para esta janela. A transmissão não será iniciada sem áudio.';
