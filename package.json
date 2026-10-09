@@ -9,7 +9,6 @@
   "scripts": {
     "dev": "npm run dev -w frontend",
     "dev:server": "npm run dev -w backend",
-    "dev:audio-bridge": "dotnet run --project native/WindowAudioBridge/WindowAudioBridge.csproj",
     "build": "npm run build:server && npm run build:frontend",
     "build:server": "npm run build -w backend",
     "build:frontend": "npm run build -w frontend",

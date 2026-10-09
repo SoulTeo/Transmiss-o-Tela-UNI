@@ -20,14 +20,6 @@ npm run dev:server
 npm run dev
 ```
 
-Para compartilhar áudio de uma janela específica no Windows, inicie também a ponte nativa em um terceiro terminal:
-
-```sh
-npm run dev:audio-bridge
-```
-
-O compartilhamento de janela abre primeiro o seletor de vídeo do navegador e depois pede que você escolha o processo correspondente para o áudio. A ponte usa captura WASAPI por processo; não encaminha o loopback geral do computador. Requer Windows 10 build 19041 ou posterior. O áudio pertence ao processo, então outras janelas do mesmo aplicativo/processo podem ser incluídas. A captura exata por HWND não é fornecida pelo Windows para aplicativos que misturam o áudio de suas janelas.
-
 Abra `http://localhost:5173`. Para usar outro backend, crie `frontend/.env.local` com `VITE_SIGNALING_URL=http://localhost:10000`. O padrão já usa o servidor local na porta 10000.
 
 ## Publicar o frontend no GitHub Pages
@@ -57,8 +49,8 @@ O projeto não fornece uma infraestrutura TURN hospedada. Para redes que bloquei
 - Apelidos limitados a 24 caracteres e eventos de sinalização validados no servidor.
 - Uma transmissão de tela por vez. Outras pessoas podem assistir; uma nova transmissão é recusada até a atual parar.
 - O botão muda para **Parar de compartilhar** durante a transmissão. Encerrar pela interface do navegador também encerra a transmissão na sala.
-- Tela inteira solicita o áudio do sistema; uma aba só envia a faixa de áudio daquela aba quando o navegador a fornece. No Windows, compartilhar uma janela usa a ponte nativa WASAPI para capturar o processo escolhido, descartando qualquer faixa de loopback geral que o navegador tenha devolvido. É necessário manter `npm run dev:audio-bridge` ativo. A captura é por processo, não por HWND: outras janelas que compartilham o processo selecionado podem entrar no áudio.
-- A origem é identificada pela superfície reportada pelo navegador. Se a origem não puder ser identificada ou não houver uma faixa segura/separada, o vídeo segue sem áudio e a interface informa o motivo.
+- O botão **Compartilhar tela** abre diretamente o seletor do navegador, que oferece as origens disponíveis no sistema. A aplicação solicita áudio da origem escolhida e mantém o vídeo mesmo quando o navegador não fornece uma faixa de áudio.
+- Guias usam a faixa de áudio da guia quando disponível; telas inteiras podem incluir o áudio do sistema. Para janelas, uma faixa explicitamente identificada como loopback geral é omitida para não misturar outros aplicativos. Quando o navegador não fornece áudio isolado da janela, o vídeo segue sem áudio e a interface informa o motivo.
 - Se o navegador bloquear a reprodução automática, aparece o botão **Ativar áudio da transmissão** ou **Reproduzir transmissão**; é preciso clicar para liberar a reprodução.
 - Uma pessoa que entra durante uma transmissão recebe uma conexão WebRTC do participante que está compartilhando.
 - Ao desconectar, o servidor remove a pessoa e atualiza a sala. O cliente tenta reconectar automaticamente.

@@ -5,7 +5,7 @@ import express from 'express';
 import { Server, type Socket } from 'socket.io';
 
 type Participant = { id: string; name: string };
-type ShareAudioSource = 'system' | 'tab' | 'window' | 'none';
+type ShareAudioSource = 'system' | 'tab' | 'window' | 'unknown' | 'none';
 type IceServer = { urls: string | string[]; username?: string; credential?: string };
 type Room = {
   participants: Map<string, Participant>;
@@ -224,7 +224,7 @@ io.on('connection', (socket) => {
       ack(callback, { ok: false, error: 'Outra pessoa já está compartilhando. Aguarde a transmissão terminar.' });
       return;
     }
-    const audioSources: ShareAudioSource[] = ['system', 'tab', 'window', 'none'];
+    const audioSources: ShareAudioSource[] = ['system', 'tab', 'window', 'unknown', 'none'];
     const audioSource = audioSources.includes(input.audioSource as ShareAudioSource)
       ? input.audioSource as ShareAudioSource
       : 'none';
