@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: screen-share-signaling
+    name: partilha-room-backend
     runtime: node
     plan: free
     buildCommand: npm ci && npm run build:server
@@ -11,9 +11,9 @@ services:
         value: production
       - key: ALLOWED_ORIGINS
         sync: false
-      - key: STUN_URLS
-        value: stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302
-      - key: TURN_URLS
+      - key: LIVEKIT_URL
         sync: false
-      - key: TURN_SECRET
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
         sync: false

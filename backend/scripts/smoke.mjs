@@ -51,16 +51,11 @@ function waitFor(socket, event, predicate = () => true) {
 }
 
 try {
-  const [healthResponse, iceResponse] = await Promise.all([
-    fetch(`${origin}/healthz`, { headers: { Origin: 'http://localhost:5173' } }),
-    fetch(`${origin}/api/ice-servers`),
-  ]);
+  const healthResponse = await fetch(`${origin}/healthz`, { headers: { Origin: 'http://localhost:5173' } });
   assert.equal(healthResponse.status, 200);
   assert.equal(healthResponse.headers.get('access-control-allow-origin'), 'http://localhost:5173');
   assert.equal((await fetch(`${origin}/healthz`, { headers: { Origin: 'https://unapproved.invalid' } })).headers.get('access-control-allow-origin'), null);
   assert.equal((await healthResponse.json()).ok, true);
-  const ice = await iceResponse.json();
-  assert.ok(ice.iceServers.some((server) => String(server.urls).startsWith('stun:')));
 
   const first = await connect();
   const created = await emitAck(first, 'room:create', {});
@@ -75,6 +70,13 @@ try {
   assert.match(invalidRoom.error, /não existe|expirou/);
 
   const joined = [await emitAck(first, 'room:join', { roomId, name: 'Pessoa 1' })];
+  assert.equal(joined[0].ok, true);
+  const claims = JSON.parse(Buffer.from(joined[0].mediaToken.split('.')[1], 'base64url').toString('utf8'));
+  assert.equal(claims.sub, first.id);
+  assert.equal(claims.name, 'Pessoa 1');
+  assert.equal(claims.video.room, roomId);
+  assert.equal(claims.video.roomJoin, true);
+  assert.equal(claims.video.canPublish, false);
   for (let index = 2; index <= 20; index += 1) {
     const socket = await connect();
     joined.push(await emitAck(socket, 'room:join', { roomId, name: `Pessoa ${index}` }));
@@ -88,36 +90,11 @@ try {
   assert.match(overflow.error, /limite máximo/);
 
   const participantTwo = sockets[1];
-  const receivedStarted = waitFor(participantTwo, 'stream:started', (event) => event.participantId === first.id);
-  assert.equal((await emitAck(first, 'stream:start', { roomId, audioSource: 'window' })).ok, true);
-  assert.equal((await receivedStarted).audioSource, 'window');
-  assert.equal((await emitAck(participantTwo, 'stream:start', { roomId })).ok, false);
-
-  const forwardedSignal = waitFor(first, 'rtc:signal', (message) => message.from === participantTwo.id);
-  participantTwo.emit('rtc:signal', {
-    roomId,
-    to: first.id,
-    signal: { type: 'answer', value: { type: 'answer', sdp: 'smoke-test' } },
-  });
-  const forwarded = await forwardedSignal;
-  assert.equal(forwarded.signal.type, 'answer');
-
-  const recoveryRequested = waitFor(first, 'rtc:restart-request', (event) => event.from === participantTwo.id);
-  participantTwo.emit('rtc:restart-request', { roomId });
-  await recoveryRequested;
-
-  const receivedStopped = waitFor(participantTwo, 'stream:stopped', (event) => event.participantId === first.id);
-  await emitAck(first, 'stream:stop', { roomId });
-  await receivedStopped;
-  const receivedSecondStarted = waitFor(sockets[2], 'stream:started', (event) => event.participantId === participantTwo.id);
-  assert.equal((await emitAck(participantTwo, 'stream:start', { roomId, audioSource: 'tab' })).ok, true);
-  assert.equal((await receivedSecondStarted).audioSource, 'tab');
-
   const participantTwoId = participantTwo.id;
   const participantLeft = waitFor(first, 'participant:left', (event) => event.participantId === participantTwoId);
   participantTwo.disconnect();
   await participantLeft;
-  console.log('Sinalização validada: health/CORS/STUN, sala e limite de criação, código inexistente, 20 participantes, bloqueio de dupla transmissão, eventos WebRTC e pedido de recuperação, parada e desconexão.');
+  console.log('Backend validado: health/CORS, token LiveKit sem permissão inicial de publicação, criação e código de sala inválido, limite de 20 participantes e remoção de participante ao desconectar. A publicação de mídia é coberta pelo teste de integração no navegador.');
 } finally {
   for (const socket of sockets) socket.disconnect();
 }

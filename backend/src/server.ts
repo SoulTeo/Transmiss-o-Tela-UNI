@@ -1,12 +1,12 @@
-import { createHmac, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import cors from 'cors';
 import express from 'express';
 import { Server, type Socket } from 'socket.io';
+import { AccessToken, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
 
 type Participant = { id: string; name: string };
 type ShareAudioSource = 'system' | 'tab' | 'window' | 'unknown' | 'none';
-type IceServer = { urls: string | string[]; username?: string; credential?: string };
 type Room = {
   participants: Map<string, Participant>;
   sharerId: string | null;
@@ -20,6 +20,12 @@ const MAX_PARTICIPANTS = 20;
 const MAX_ACTIVE_ROOMS = 2_000;
 const ROOM_ID_PATTERN = /^[A-Z0-9]{6}$/;
 const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || '';
+const liveKitAdmin = LIVEKIT_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET
+  ? new RoomServiceClient(LIVEKIT_URL.replace(/^ws:/, 'http:').replace(/^wss:/, 'https:'), LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+  : null;
 const rooms = new Map<string, Room>();
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://127.0.0.1:5173')
   .split(',').map((origin) => origin.trim()).filter(Boolean);
@@ -33,30 +39,35 @@ app.use(cors({
 }));
 app.get('/healthz', (_request, response) => response.json({ ok: true }));
 
-function iceServers() {
-  const stunUrls = (process.env.STUN_URLS || 'stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302')
-    .split(',').map((url) => url.trim()).filter(Boolean);
-  const servers: IceServer[] = stunUrls.map((url) => ({ urls: url }));
-  const turnUrls = (process.env.TURN_URLS || '').split(',').map((url) => url.trim()).filter(Boolean);
-  const secret = process.env.TURN_SECRET;
-  let turnConfigured = false;
-
-  if (turnUrls.length && secret) {
-    const requestedTtl = Number(process.env.TURN_CREDENTIAL_TTL_SECONDS || 3600);
-    const ttlSeconds = Number.isFinite(requestedTtl)
-      ? Math.min(86_400, Math.max(300, requestedTtl))
-      : 3600;
-    const expiry = Math.floor(Date.now() / 1000) + ttlSeconds;
-    const username = `${expiry}:${randomBytes(8).toString('hex')}`;
-    const credential = createHmac('sha1', secret).update(username).digest('base64');
-    servers.push({ urls: turnUrls, username, credential });
-    turnConfigured = true;
+function createMediaToken(roomId: string, participantId: string, name: string) {
+  if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET || !liveKitAdmin) {
+    throw new Error('O serviço de mídia LiveKit não está configurado.');
   }
-
-  return { iceServers: servers, turnConfigured };
+  const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+    identity: participantId,
+    name,
+    ttl: '4h',
+  });
+  token.addGrant({
+    roomJoin: true,
+    room: roomId,
+    canSubscribe: true,
+    canPublish: false,
+  });
+  return token.toJwt();
 }
 
-app.get('/api/ice-servers', (_request, response) => response.json(iceServers()));
+async function setParticipantPublishPermission(roomId: string, participantId: string, canPublish: boolean) {
+  if (!liveKitAdmin) throw new Error('O serviço de mídia LiveKit não está configurado.');
+  await liveKitAdmin.updateParticipant(roomId, participantId, {
+    permission: {
+      canSubscribe: true,
+      canPublish,
+      canPublishData: false,
+      canPublishSources: canPublish ? [TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO] : [],
+    },
+  });
+}
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -129,9 +140,13 @@ function leaveCurrentRoom(socket: Socket) {
   io.to(roomId).emit('participant:left', { participantId: socket.id });
 
   if (room.sharerId === socket.id) {
+    const stoppedSharerId = room.sharerId;
     room.sharerId = null;
     room.audioSource = null;
     io.to(roomId).emit('stream:stopped', { participantId: socket.id });
+    void setParticipantPublishPermission(roomId, stoppedSharerId, false).catch((error) => {
+      console.error('Failed to revoke LiveKit publish permission after participant left:', error);
+    });
   }
 
   socket.leave(roomId);
@@ -160,7 +175,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('room:join', (payload: unknown, callback: unknown) => {
+  socket.on('room:join', async (payload: unknown, callback: unknown) => {
     const input = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
     const roomId = typeof input.roomId === 'string' ? input.roomId.trim().toUpperCase() : '';
     const rawName = typeof input.name === 'string' ? input.name : '';
@@ -187,6 +202,18 @@ io.on('connection', (socket) => {
       return;
     }
 
+    let mediaToken: string;
+    try {
+      mediaToken = await createMediaToken(roomId, socket.id, name);
+    } catch (error) {
+      ack(callback, { ok: false, error: error instanceof Error ? error.message : 'Não foi possível autenticar no serviço de mídia.' });
+      return;
+    }
+    if (!socket.connected || rooms.get(roomId) !== room) {
+      ack(callback, { ok: false, error: 'A conexão com a sala foi encerrada. Entre novamente.' });
+      return;
+    }
+
     room.emptyUntil = null;
     const participant = { id: socket.id, name };
     const existingParticipants = [...room.participants.values()];
@@ -200,6 +227,8 @@ io.on('connection', (socket) => {
       participants: [...existingParticipants, participant],
       sharerId: room.sharerId,
       audioSource: room.audioSource,
+      mediaToken,
+      mediaUrl: LIVEKIT_URL,
     });
     socket.to(roomId).emit('participant:joined', participant);
     if (room.sharerId) {
@@ -212,7 +241,7 @@ io.on('connection', (socket) => {
     ack(callback, { ok: true });
   });
 
-  socket.on('stream:start', (payload: unknown, callback: unknown) => {
+  socket.on('stream:start', async (payload: unknown, callback: unknown) => {
     const roomId = socket.data.roomId as string | undefined;
     const input = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
     const room = roomId ? rooms.get(roomId) : undefined;
@@ -230,15 +259,38 @@ io.on('connection', (socket) => {
       : 'none';
     room.sharerId = socket.id;
     room.audioSource = audioSource;
+    try {
+      await setParticipantPublishPermission(roomId, socket.id, true);
+    } catch (error) {
+      if (room.sharerId === socket.id) {
+        room.sharerId = null;
+        room.audioSource = null;
+      }
+      console.error('Failed to grant LiveKit publish permission:', error);
+      ack(callback, { ok: false, error: 'Não foi possível autorizar a transmissão no serviço de mídia. Tente novamente.' });
+      return;
+    }
+    if (!socket.connected || rooms.get(roomId) !== room || room.sharerId !== socket.id || !room.participants.has(socket.id)) {
+      void setParticipantPublishPermission(roomId, socket.id, false).catch((error) => {
+        console.error('Failed to revoke LiveKit publish permission after canceled start:', error);
+      });
+      ack(callback, { ok: false, error: 'A conexão com a sala foi encerrada. Tente novamente.' });
+      return;
+    }
     io.to(roomId).emit('stream:started', { participantId: socket.id, audioSource });
     ack(callback, { ok: true });
   });
 
-  socket.on('stream:stop', (payload: unknown, callback: unknown) => {
+  socket.on('stream:stop', async (payload: unknown, callback: unknown) => {
     const roomId = socket.data.roomId as string | undefined;
     const input = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
     const room = roomId ? rooms.get(roomId) : undefined;
     if (roomId && room && input.roomId === roomId && room.sharerId === socket.id) {
+      try {
+        await setParticipantPublishPermission(roomId, socket.id, false);
+      } catch (error) {
+        console.error('Failed to revoke LiveKit publish permission:', error);
+      }
       room.sharerId = null;
       room.audioSource = null;
       io.to(roomId).emit('stream:stopped', { participantId: socket.id });
@@ -246,37 +298,9 @@ io.on('connection', (socket) => {
     ack(callback, { ok: true });
   });
 
-  socket.on('rtc:signal', (payload: unknown) => {
-    const roomId = socket.data.roomId as string | undefined;
-    const input = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
-    const room = roomId ? rooms.get(roomId) : undefined;
-    const targetId = typeof input.to === 'string' ? input.to : '';
-    const signal = input.signal && typeof input.signal === 'object' ? input.signal as Record<string, unknown> : {};
-    const kind = signal.type;
-    if (!room || input.roomId !== roomId || !room.participants.has(socket.id) || !room.participants.has(targetId)) return;
-    if (!['offer', 'answer', 'candidate'].includes(String(kind))) return;
-    if (kind === 'offer' && room.sharerId !== socket.id) return;
-    if (kind === 'answer' && room.sharerId !== targetId) return;
-    if (kind === 'candidate' && room.sharerId !== socket.id && room.sharerId !== targetId) return;
-    let size = 0;
-    try { size = Buffer.byteLength(JSON.stringify(signal)); } catch { return; }
-    if (size > 64 * 1024 || !signal.value || typeof signal.value !== 'object') return;
-    io.to(targetId).emit('rtc:signal', { from: socket.id, signal });
-  });
-
-  socket.on('rtc:restart-request', (payload: unknown) => {
-    const roomId = socket.data.roomId as string | undefined;
-    const input = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
-    const room = roomId ? rooms.get(roomId) : undefined;
-    const sharerId = room?.sharerId;
-    if (!room || input.roomId !== roomId || !room.participants.has(socket.id) || !sharerId || sharerId === socket.id) return;
-    if (!room.participants.has(sharerId)) return;
-    io.to(sharerId).emit('rtc:restart-request', { from: socket.id });
-  });
-
   socket.on('disconnecting', () => leaveCurrentRoom(socket));
 });
 
 httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`Screen-share signaling server listening on ${PORT}`);
+  console.log(`Partilha room backend listening on ${PORT}`);
 });

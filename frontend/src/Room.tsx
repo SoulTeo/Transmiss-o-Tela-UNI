@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { ParticipantEvent, Room as LiveKitRoom, RoomEvent, Track, type RemoteTrack } from 'livekit-client';
 import { io, type Socket } from 'socket.io-client';
-import { backendUrl, getIceServers, roomPath } from './config';
+import { backendUrl, roomPath } from './config';
 import type { Participant, ServerAck } from './types';
 
 type JoinResult = ServerAck<{
@@ -9,11 +10,41 @@ type JoinResult = ServerAck<{
   participants: Participant[];
   sharerId: string | null;
   audioSource: ShareAudioSource | null;
+  mediaToken: string;
+  mediaUrl: string;
 }>;
-type PeerSignal = { from: string; signal: { type: 'offer' | 'answer' | 'candidate'; value: RTCSessionDescriptionInit | RTCIceCandidateInit } };
 type ShareAudioSource = 'system' | 'tab' | 'window' | 'unknown' | 'none';
 type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
 type ShareStarted = { participantId: string; audioSource: ShareAudioSource };
+
+function waitForPublishPermission(mediaRoom: LiveKitRoom): Promise<void> {
+  const participant = mediaRoom.localParticipant;
+  if (participant.permissions?.canPublish) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      participant.off(ParticipantEvent.ParticipantPermissionsChanged, onPermissionsChanged);
+      reject(new Error('O servidor de mídia não confirmou a permissão de publicação.'));
+    }, 5000);
+    const onPermissionsChanged = () => {
+      if (!participant.permissions?.canPublish) return;
+      window.clearTimeout(timeout);
+      participant.off(ParticipantEvent.ParticipantPermissionsChanged, onPermissionsChanged);
+      resolve();
+    };
+    participant.on(ParticipantEvent.ParticipantPermissionsChanged, onPermissionsChanged);
+  });
+}
+
+function stopShareOnServer(socket: Socket | null, roomId: string): Promise<void> {
+  if (!socket?.connected) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(resolve, 7000);
+    socket.timeout(6500).emit('stream:stop', { roomId }, () => {
+      window.clearTimeout(timer);
+      resolve();
+    });
+  });
+}
 
 function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
   for (const track of tracks) {
@@ -116,182 +147,142 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const mountedRef = useRef(true);
   const joinedRef = useRef(false);
   const localStreamRef = useRef<MediaStream | null>(null);
-  const peerConnections = useRef(new Map<string, RTCPeerConnection>());
-  const peerCreations = useRef(new Map<string, Promise<RTCPeerConnection>>());
-  const peerEpochs = useRef(new Map<string, number>());
-  const pendingCandidates = useRef(new Map<string, RTCIceCandidateInit[]>());
-  const remoteStreams = useRef(new Map<string, MediaStream>());
+  const mediaRoomRef = useRef<LiveKitRoom | null>(null);
+  const stoppingShareRef = useRef(false);
+  const pendingRemoteTracksRef = useRef(new Set<RemoteTrack>());
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const audioEnabledRef = useRef(audioEnabled);
+  audioEnabledRef.current = audioEnabled;
 
   const sharer = useMemo(() => participants.find((person) => person.id === sharerId), [participants, sharerId]);
   const isSharing = joined && localSharing;
   const shareUrl = `${window.location.origin}${roomPath(roomId)}`;
 
-  const closePeer = useCallback((peerId: string, clearCandidates = true) => {
-    peerEpochs.current.set(peerId, (peerEpochs.current.get(peerId) || 0) + 1);
-    peerCreations.current.delete(peerId);
-    remoteStreams.current.delete(peerId);
-    const pc = peerConnections.current.get(peerId);
-    if (pc) {
-      pc.onicecandidate = null;
-      pc.ontrack = null;
-      pc.onconnectionstatechange = null;
-      pc.close();
-      peerConnections.current.delete(peerId);
+  const clearRemoteMedia = useCallback(() => {
+    pendingRemoteTracksRef.current.clear();
+    const video = remoteVideoRef.current;
+    if (video) {
+      video.pause();
+      video.srcObject = null;
     }
-    if (clearCandidates) pendingCandidates.current.delete(peerId);
+    const audio = remoteAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.srcObject = null;
+    }
+    setRemoteHasAudio(false);
+    setPlaybackBlocked(false);
   }, []);
 
-  const closeAllPeers = useCallback(() => {
-    const peerIds = new Set([...peerConnections.current.keys(), ...peerCreations.current.keys()]);
-    for (const peerId of peerIds) closePeer(peerId);
-  }, [closePeer]);
+  const attachRemoteTrack = useCallback((track: RemoteTrack) => {
+    if (track.source === Track.Source.ScreenShare && track.kind === Track.Kind.Video) {
+      const video = remoteVideoRef.current;
+      if (!video) {
+        pendingRemoteTracksRef.current.add(track);
+        return;
+      }
+      pendingRemoteTracksRef.current.delete(track);
+      video.muted = true;
+      track.attach(video);
+      void video.play().then(
+        () => setPlaybackBlocked(false),
+        () => setPlaybackBlocked(true),
+      );
+    } else if (track.source === Track.Source.ScreenShareAudio && track.kind === Track.Kind.Audio) {
+      setRemoteHasAudio(true);
+      const audio = remoteAudioRef.current;
+      if (!audio) {
+        pendingRemoteTracksRef.current.add(track);
+        return;
+      }
+      pendingRemoteTracksRef.current.delete(track);
+      audio.muted = !audioEnabledRef.current;
+      track.attach(audio);
+      void audio.play().then(
+        () => setPlaybackBlocked(false),
+        () => setPlaybackBlocked(true),
+      );
+    }
+  }, []);
 
-  const stopLocalTracks = useCallback(() => {
+  const disconnectMediaRoom = useCallback(async () => {
+    const mediaRoom = mediaRoomRef.current;
+    mediaRoomRef.current = null;
+    if (mediaRoom) await mediaRoom.disconnect();
+    clearRemoteMedia();
+  }, [clearRemoteMedia]);
+
+  const stopLocalTracks = useCallback(async () => {
     const stream = localStreamRef.current;
-    if (stream) stream.getTracks().forEach((track) => track.stop());
     localStreamRef.current = null;
+    const mediaRoom = mediaRoomRef.current;
+    if (stream && mediaRoom) {
+      await Promise.allSettled(stream.getTracks().map((track) => mediaRoom.localParticipant.unpublishTrack(track, false)));
+    }
+    if (stream) stream.getTracks().forEach((track) => track.stop());
   }, []);
 
-  const leaveRoom = useCallback(() => {
+  const leaveRoom = useCallback(async () => {
     const socket = socketRef.current;
+    await stopLocalTracks();
+    await stopShareOnServer(socket, roomId);
+    await disconnectMediaRoom();
     socket?.emit('room:leave', { roomId });
     socket?.disconnect();
     socketRef.current = null;
     joinedRef.current = false;
-    closeAllPeers();
-    stopLocalTracks();
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     setParticipants([]);
     setJoined(false);
     setSharerId(null);
     setLocalSharing(false);
     setAudioSource(null);
     onHome();
-  }, [closeAllPeers, onHome, roomId, stopLocalTracks]);
+  }, [disconnectMediaRoom, onHome, roomId, stopLocalTracks]);
 
-  const sendSignal = useCallback((to: string, signal: PeerSignal['signal']) => {
-    socketRef.current?.emit('rtc:signal', { roomId, to, signal });
-  }, [roomId]);
-
-  const createPeer = useCallback((peerId: string, offer: boolean): Promise<RTCPeerConnection> => {
-    const existing = peerConnections.current.get(peerId);
-    if (existing) return Promise.resolve(existing);
-    const pending = peerCreations.current.get(peerId);
-    if (pending) return pending;
-
-    const epoch = peerEpochs.current.get(peerId) || 0;
-    const creation = (async () => {
-      const iceServers = await getIceServers();
-      if (!mountedRef.current || (peerEpochs.current.get(peerId) || 0) !== epoch) throw new Error('Peer connection was cancelled');
-      const stream = offer ? localStreamRef.current : null;
-      if (offer && !stream) throw new Error('Screen sharing has stopped');
-      const pc = new RTCPeerConnection({ iceServers });
-      peerConnections.current.set(peerId, pc);
-      pc.onicecandidate = (event) => {
-        if (event.candidate) sendSignal(peerId, { type: 'candidate', value: event.candidate.toJSON() });
-      };
-      pc.ontrack = (event) => {
-        const remoteStream = remoteStreams.current.get(peerId) || new MediaStream();
-        remoteStreams.current.set(peerId, remoteStream);
-        const syncReceiverTracks = () => {
-          const receiverTracks = pc.getReceivers().map((receiver) => receiver.track)
-            .filter((track) => track.readyState === 'live');
-          if (event.track.readyState === 'live' && !receiverTracks.some((track) => track.id === event.track.id)) {
-            receiverTracks.push(event.track);
-          }
-          for (const track of receiverTracks) {
-            if (!remoteStream.getTracks().some((existing) => existing.id === track.id)) remoteStream.addTrack(track);
-          }
-          setRemoteHasAudio(receiverTracks.some((track) => track.kind === 'audio'));
-
-          const video = remoteVideoRef.current;
-          if (!video) return;
-          if (video.srcObject !== remoteStream) video.srcObject = remoteStream;
-          void video.play().then(
-            () => setPlaybackBlocked(false),
-            () => setPlaybackBlocked(true),
-          );
-        };
-        syncReceiverTracks();
-        event.track.addEventListener('ended', syncReceiverTracks, { once: true });
-        event.track.addEventListener('mute', syncReceiverTracks);
-        event.track.addEventListener('unmute', syncReceiverTracks);
-      };
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') closePeer(peerId);
-      };
-
-      try {
-        if (stream) {
-          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-          const description = await pc.createOffer();
-          await pc.setLocalDescription(description);
-          sendSignal(peerId, { type: 'offer', value: pc.localDescription!.toJSON() });
-        }
-        return pc;
-      } catch (creationError) {
-        closePeer(peerId);
-        throw creationError;
+  const connectMediaRoom = useCallback(async (url: string, token: string) => {
+    if (!url || !token) throw new Error('O servidor não forneceu acesso ao serviço de mídia.');
+    await disconnectMediaRoom();
+    const mediaRoom = new LiveKitRoom({ adaptiveStream: true, dynacast: true });
+    mediaRoom.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+      if (participant.identity === selfIdRef.current) return;
+      attachRemoteTrack(track);
+    });
+    mediaRoom.on(RoomEvent.TrackUnsubscribed, (track) => {
+      pendingRemoteTracksRef.current.delete(track);
+      if (track.source === Track.Source.ScreenShare && track.kind === Track.Kind.Video) {
+        const video = remoteVideoRef.current;
+        if (video) track.detach(video);
+      } else if (track.source === Track.Source.ScreenShareAudio && track.kind === Track.Kind.Audio) {
+        const audio = remoteAudioRef.current;
+        if (audio) track.detach(audio);
+        setRemoteHasAudio(false);
       }
-    })();
-
-    peerCreations.current.set(peerId, creation);
-    void creation.then(
-      () => { if (peerCreations.current.get(peerId) === creation) peerCreations.current.delete(peerId); },
-      () => { if (peerCreations.current.get(peerId) === creation) peerCreations.current.delete(peerId); },
-    );
-    return creation;
-  }, [closePeer, sendSignal]);
-
-  const flushCandidates = useCallback(async (peerId: string, pc: RTCPeerConnection) => {
-    const candidates = pendingCandidates.current.get(peerId) || [];
-    pendingCandidates.current.delete(peerId);
-    for (const candidate of candidates) {
-      try { await pc.addIceCandidate(candidate); } catch { /* Ignore candidates invalidated by a restarted connection. */ }
-    }
-  }, []);
-
-  const negotiateWith = useCallback(async (peerId: string) => {
-    try { await createPeer(peerId, true); }
-    catch { setError('Não foi possível iniciar a conexão de vídeo com um participante.'); }
-  }, [createPeer]);
-
-  const handleSignal = useCallback(async ({ from, signal }: PeerSignal) => {
+    });
+    mediaRoom.on(RoomEvent.Reconnecting, () => setConnectionLost(true));
+    mediaRoom.on(RoomEvent.Reconnected, () => setConnectionLost(false));
+    mediaRoom.on(RoomEvent.Disconnected, () => {
+      if (mediaRoomRef.current !== mediaRoom || !mountedRef.current) return;
+      mediaRoomRef.current = null;
+      clearRemoteMedia();
+      setConnectionLost(true);
+      setLocalSharing(false);
+      void stopLocalTracks();
+    });
+    mediaRoomRef.current = mediaRoom;
     try {
-      if (signal.type === 'offer') {
-        closePeer(from, false);
-        const pc = await createPeer(from, false);
-        await pc.setRemoteDescription(signal.value as RTCSessionDescriptionInit);
-        await flushCandidates(from, pc);
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        sendSignal(from, { type: 'answer', value: pc.localDescription!.toJSON() });
-      } else if (signal.type === 'answer') {
-        const pc = peerConnections.current.get(from);
-        if (!pc) return;
-        await pc.setRemoteDescription(signal.value as RTCSessionDescriptionInit);
-        await flushCandidates(from, pc);
-      } else {
-        const candidate = signal.value as RTCIceCandidateInit;
-        const pc = peerConnections.current.get(from);
-        if (pc?.remoteDescription) {
-          await pc.addIceCandidate(candidate);
-        } else {
-          const pending = pendingCandidates.current.get(from) || [];
-          pending.push(candidate);
-          pendingCandidates.current.set(from, pending);
-        }
-      }
-    } catch {
-      setError('A conexão de mídia foi interrompida. Tente parar e iniciar o compartilhamento novamente.');
+      await mediaRoom.connect(url, token);
+    } catch (connectError) {
+      if (mediaRoomRef.current === mediaRoom) mediaRoomRef.current = null;
+      await mediaRoom.disconnect();
+      throw connectError;
     }
-  }, [closePeer, createPeer, flushCandidates, sendSignal]);
+  }, [attachRemoteTrack, clearRemoteMedia, disconnectMediaRoom, stopLocalTracks]);
 
   const join = useCallback((socket: Socket) => {
     setConnecting(true);
     const cleanName = nameRef.current.trim().replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 24);
-    socket.timeout(10_000).emit('room:join', { roomId, name: cleanName }, (timeoutError: Error | null, result?: JoinResult) => {
+    socket.timeout(10_000).emit('room:join', { roomId, name: cleanName }, async (timeoutError: Error | null, result?: JoinResult) => {
       if (!mountedRef.current) return;
       setConnecting(false);
       if (timeoutError || !result) {
@@ -306,18 +297,36 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
         setJoined(false);
         return;
       }
+      selfIdRef.current = result.self.id;
+      try {
+        await connectMediaRoom(result.mediaUrl, result.mediaToken);
+      } catch {
+        socket.emit('room:leave', { roomId });
+        joinedRef.current = false;
+        setJoined(false);
+        setError('Não foi possível conectar ao serviço de transmissão. Tente novamente em instantes.');
+        return;
+      }
+      if (!mountedRef.current || !socket.connected) {
+        await disconnectMediaRoom();
+        return;
+      }
       joinedRef.current = true;
       setJoined(true);
       setError('');
       setConnectionLost(false);
-      selfIdRef.current = result.self.id;
       setSelfId(result.self.id);
       setParticipants(result.participants);
       setSharerId(result.sharerId);
       setAudioSource(result.sharerId ? result.audioSource : null);
       sessionStorage.setItem('screen-share-name', cleanName);
     });
-  }, [roomId]);
+  }, [connectMediaRoom, disconnectMediaRoom, roomId]);
+
+  useEffect(() => {
+    if (!joined) return;
+    for (const track of pendingRemoteTracksRef.current) attachRemoteTrack(track);
+  }, [attachRemoteTrack, joined]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -333,7 +342,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     socketRef.current = socket;
     socket.on('connect', () => {
       setConnectionLost(false);
-      if (joinedRef.current) closeAllPeers();
+      if (joinedRef.current) void disconnectMediaRoom();
       if (nameRef.current.trim()) join(socket);
     });
     socket.on('disconnect', () => {
@@ -341,8 +350,10 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       setConnecting(false);
       setConnectionLost(true);
       joinedRef.current = false;
-      closeAllPeers();
-      stopLocalTracks();
+      void (async () => {
+        await stopLocalTracks();
+        await disconnectMediaRoom();
+      })();
       setSharerId(null);
       setLocalSharing(false);
       setAudioSource(null);
@@ -350,51 +361,43 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     socket.on('connect_error', () => setConnectionLost(true));
     socket.on('participant:joined', (participant: Participant) => {
       setParticipants((current) => current.some((person) => person.id === participant.id) ? current : [...current, participant]);
-      if (localStreamRef.current && joinedRef.current) void negotiateWith(participant.id);
     });
     socket.on('participant:left', ({ participantId }: { participantId: string }) => {
       setParticipants((current) => current.filter((person) => person.id !== participantId));
-      closePeer(participantId);
     });
     socket.on('stream:started', ({ participantId, audioSource: incomingAudioSource }: ShareStarted) => {
       setSharerId(participantId);
       setAudioSource(incomingAudioSource);
-      setRemoteHasAudio(null);
       setPlaybackBlocked(false);
       setError('');
-      if (participantId !== selfIdRef.current) {
-        closeAllPeers();
-        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-      }
+      setRemoteHasAudio(incomingAudioSource === 'none' ? false : null);
     });
     socket.on('stream:stopped', ({ participantId }: { participantId: string }) => {
       setSharerId((current) => current === participantId ? null : current);
       setAudioSource(null);
-      setRemoteHasAudio(false);
-      setPlaybackBlocked(false);
       if (participantId === selfIdRef.current) {
-        closeAllPeers();
-        stopLocalTracks();
+        void stopLocalTracks();
         setLocalSharing(false);
         setLocalAudioNotice('');
       } else {
-        closePeer(participantId);
-        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+        clearRemoteMedia();
       }
     });
-    socket.on('rtc:signal', (signal: PeerSignal) => void handleSignal(signal));
 
     socket.connect();
     return () => {
       mountedRef.current = false;
-      socket.emit('room:leave', { roomId });
-      socket.disconnect();
       if (socketRef.current === socket) socketRef.current = null;
       joinedRef.current = false;
-      closeAllPeers();
-      stopLocalTracks();
+      void (async () => {
+        await stopLocalTracks();
+        await stopShareOnServer(socket, roomId);
+        await disconnectMediaRoom();
+        socket.emit('room:leave', { roomId });
+        socket.disconnect();
+      })();
     };
-  }, [closeAllPeers, closePeer, handleSignal, join, negotiateWith, roomId, stopLocalTracks]);
+  }, [clearRemoteMedia, disconnectMediaRoom, join, roomId, stopLocalTracks]);
 
   function enter(event: FormEvent) {
     event.preventDefault();
@@ -470,7 +473,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     }));
 
     const captureAudio = prepareCaptureAudio(stream, displaySurface);
-    console.info('[screen-share] faixas encaminhadas ao WebRTC', JSON.stringify({
+    console.info('[screen-share] faixas encaminhadas ao LiveKit SFU', JSON.stringify({
       audioSource: captureAudio.audioSource,
       liveAudioTrackCount: stream.getAudioTracks().filter((track) => track.readyState === 'live').length,
       audioTracks: stream.getAudioTracks().map((track) => ({
@@ -503,29 +506,56 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       return;
     }
     if (captureEnded || videoTrack?.readyState === 'ended') {
-      await stopSharing();
+      socketRef.current?.emit('stream:stop', { roomId });
       stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    const mediaRoom = mediaRoomRef.current;
+    if (!mediaRoom || mediaRoom.state !== 'connected') {
+      socketRef.current?.emit('stream:stop', { roomId });
+      stream.getTracks().forEach((track) => track.stop());
+      setLocalAudioNotice('');
+      setError('A conexão com o serviço de transmissão foi perdida. Reconecte-se à sala e tente novamente.');
       return;
     }
     localStreamRef.current = stream;
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
     setSharerId(selfId);
     setLocalSharing(true);
-    for (const participant of participants) {
-      if (participant.id !== selfId) void negotiateWith(participant.id);
+    try {
+      await waitForPublishPermission(mediaRoom);
+      for (const track of stream.getTracks()) {
+        await mediaRoom.localParticipant.publishTrack(track, {
+          source: track.kind === 'video' ? Track.Source.ScreenShare : Track.Source.ScreenShareAudio,
+          name: track.kind === 'video' ? 'screen' : 'screen-audio',
+          stream: 'screen',
+          ...(track.kind === 'video' ? { screenShareEncoding: { maxBitrate: 4_000_000, maxFramerate: 30 } } : {}),
+        });
+      }
+    } catch {
+      await stopLocalTracks();
+      await stopShareOnServer(socketRef.current, roomId);
+      setSharerId(null);
+      setLocalSharing(false);
+      setLocalAudioNotice('');
+      setError('Não foi possível publicar a transmissão no servidor de mídia. Tente novamente.');
     }
   }
 
   async function stopSharing() {
-    const socket = socketRef.current;
-    socket?.emit('stream:stop', { roomId });
-    closeAllPeers();
-    stopLocalTracks();
-    setSharerId(null);
-    setLocalSharing(false);
-    setAudioSource(null);
-    setLocalAudioNotice('');
-    setPlaybackBlocked(false);
+    if (stoppingShareRef.current) return;
+    stoppingShareRef.current = true;
+    try {
+      await stopLocalTracks();
+      await stopShareOnServer(socketRef.current, roomId);
+      clearRemoteMedia();
+      setSharerId(null);
+      setLocalSharing(false);
+      setAudioSource(null);
+      setLocalAudioNotice('');
+    } finally {
+      stoppingShareRef.current = false;
+    }
   }
 
   async function copyLink() {
@@ -541,11 +571,12 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   function toggleAudio() {
     const nextEnabled = !audioEnabled;
     setAudioEnabled(nextEnabled);
-    const video = remoteVideoRef.current;
-    if (!video) return;
-    video.muted = !nextEnabled;
+    audioEnabledRef.current = nextEnabled;
+    const audio = remoteAudioRef.current;
+    if (!audio) return;
+    audio.muted = !nextEnabled;
     if (nextEnabled) {
-      void video.play().then(
+      void audio.play().then(
         () => setPlaybackBlocked(false),
         () => setPlaybackBlocked(true),
       );
@@ -553,14 +584,17 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   }
 
   function unlockPlayback() {
-    const video = remoteVideoRef.current;
-    if (!video) return;
     setAudioEnabled(true);
-    video.muted = false;
-    void video.play().then(
-      () => setPlaybackBlocked(false),
-      () => setPlaybackBlocked(true),
-    );
+    audioEnabledRef.current = true;
+    if (remoteVideoRef.current) void remoteVideoRef.current.play();
+    const audio = remoteAudioRef.current;
+    if (audio) {
+      audio.muted = false;
+      void audio.play().then(
+        () => setPlaybackBlocked(false),
+        () => setPlaybackBlocked(true),
+      );
+    }
   }
 
   return (
@@ -611,7 +645,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
             <section className={`stage ${sharerId ? 'stage-live' : ''}`}>
               {sharerId ? (
                 <>
-                  <video ref={remoteVideoRef} className="remote-video" autoPlay playsInline controls={false} muted={!audioEnabled || sharerId === selfId} />
+                  <video ref={remoteVideoRef} className="remote-video" autoPlay playsInline controls={false} muted />
                   {sharerId === selfId ? (
                     <div className="self-preview"><Icon name="screen" /><span>Sua tela está sendo compartilhada</span><small>Os participantes da sala podem assistir</small></div>
                   ) : (
@@ -632,6 +666,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
                 </div>
               )}
             </section>
+            <audio ref={remoteAudioRef} autoPlay muted={!audioEnabled} className="remote-audio" />
 
             <section className="people-strip">
               <div className="people-title"><Icon name="users" /><h2>Na sala</h2><span>{participants.length}<b>/20</b></span></div>

@@ -1,102 +1,91 @@
 # Partilha — salas de compartilhamento de tela
 
-MVP de compartilhamento de tela em salas privadas. O frontend usa React, TypeScript e Vite; o backend Node.js mantém salas em memória e faz a sinalização do WebRTC com Socket.IO. O backend não recebe nem grava áudio ou vídeo.
+Aplicação de compartilhamento de tela em salas privadas. O frontend usa React, TypeScript e Vite. O backend Node.js mantém as salas e a presença dos participantes por Socket.IO. O LiveKit SFU encaminha áudio e vídeo aos espectadores: o transmissor publica uma cópia no servidor de mídia, em vez de abrir uma conexão P2P para cada pessoa.
+
+A captura permanece local no navegador de cada transmissor, conforme a decisão para esta migração. Selkies não é usado: ele transmite uma sessão de desktop hospedada em um host, o que mudaria de onde a tela de cada participante é capturada.
+
+A captura continua acontecendo no navegador de quem transmite, por `getDisplayMedia()`. A conexão de mídia usa WebRTC entre cada navegador e o LiveKit, mas a mídia passa pelo SFU; participantes não enviam cópias diretamente uns aos outros.
 
 ## Rodar localmente
 
-Requer Node.js 20.19.x ou 22.12 ou mais recente (até a série 26).
+Requer Node.js 20.19.x ou 22.12 ou mais recente (até a série 26) e o servidor LiveKit instalado. Veja [Running LiveKit locally](https://docs.livekit.io/transport/self-hosting/local/) para instalar o executável no Windows, macOS ou Linux.
+
+Instale as dependências:
 
 ```sh
 npm install
 ```
 
-Em dois terminais, na raiz do projeto:
+Inicie o LiveKit em modo de desenvolvimento em um terminal:
 
 ```sh
+livekit-server --dev --bind 127.0.0.1
+```
+
+Em outro terminal PowerShell, configure o backend e inicie as salas:
+
+```powershell
+$env:LIVEKIT_URL = "ws://localhost:7880"
+$env:LIVEKIT_API_KEY = "devkey"
+$env:LIVEKIT_API_SECRET = "secret"
 npm run dev:server
 ```
+
+Em um terceiro terminal, inicie o frontend:
 
 ```sh
 npm run dev
 ```
 
-Abra `http://localhost:5173`. Para usar outro backend, crie `frontend/.env.local` com `VITE_SIGNALING_URL=http://localhost:10000`. O padrão já usa o servidor local na porta 10000.
+Abra `http://localhost:5173`. As chaves `devkey` e `secret` são apenas as credenciais de desenvolvimento do servidor LiveKit local; nunca as use em produção. Se o backend estiver em outro endereço, defina `VITE_BACKEND_URL` em `frontend/.env.local`.
 
-## Publicar o frontend no GitHub Pages
+## Publicar
 
-1. Envie esta pasta para um repositório GitHub e habilite **Settings → Pages → GitHub Actions**.
-2. Faça o deploy do backend no Render, usando o `render.yaml`.
-3. Em **Settings → Secrets and variables → Actions → Variables**, crie `VITE_SIGNALING_URL` com a URL HTTPS do backend, por exemplo `https://screen-share-signaling.onrender.com`.
-4. Faça push para a branch `main`. A action compila e publica o frontend. A URL de um repositório chamado `screen-share` será `https://SEU_USUARIO.github.io/screen-share/`.
+O frontend pode continuar no GitHub Pages. Configure a variável de Actions `VITE_BACKEND_URL` com a URL HTTPS do backend de salas. A variável antiga `VITE_SIGNALING_URL` continua aceita como compatibilidade.
 
-O arquivo `frontend/public/404.html` permite abrir e atualizar diretamente os links `/sala/ABC123` no GitHub Pages.
+O backend Node pode continuar no Render, usando [`render.yaml`](render.yaml). Configure no serviço:
 
-## Publicar o backend no Render
+- `ALLOWED_ORIGINS`: origem do frontend publicado.
+- `LIVEKIT_URL`: endereço público do LiveKit, começando com `wss://`.
+- `LIVEKIT_API_KEY` e `LIVEKIT_API_SECRET`: credenciais do projeto LiveKit; o segredo fica somente no backend.
 
-Crie um **Blueprint** no Render apontando para o repositório. O manifesto seleciona Node, compila TypeScript e inicia o servidor na porta fornecida pelo Render. Configure `ALLOWED_ORIGINS` com a origem exata do GitHub Pages, por exemplo `https://SEU_USUARIO.github.io` (sem barra ao final). Para desenvolvimento local, o servidor permite `localhost:5173` e `127.0.0.1:5173` por padrão.
+O servidor LiveKit é um serviço de mídia separado e não está incluído no manifesto do Render. Em produção, use LiveKit Cloud ou hospede o SFU em uma máquina que permita abrir os endereços de mídia exigidos pelo WebRTC. A configuração padrão self-hosted do LiveKit usa WebSocket/API na porta 7880, WebRTC sobre TCP na 7881 e UDP na faixa 50000–60000; confira [Ports and firewall](https://docs.livekit.io/transport/self-hosting/ports-firewall/) para adaptar as regras ao seu host. O backend de salas não recebe nem grava mídia.
 
-O plano Free do Render suspende o serviço após 15 minutos sem requisições HTTP ou mensagens WebSocket recebidas; despertar pode levar cerca de um minuto. Uma sala também é encerrada quando o servidor reinicia, pois o estado fica em memória. Consulte as [limitações do plano Free](https://render.com/docs/free).
+## Comportamento das salas
 
-## STUN e TURN
+- Os códigos têm seis caracteres; salas vazias expiram após 15 minutos. O estado continua em memória e se perde quando o backend reinicia.
+- Cada sala aceita até 20 participantes e apenas uma transmissão ativa. O backend serializa o início e a parada da transmissão.
+- Apelidos têm até 24 caracteres. Qualquer pessoa com o código pode entrar; nomes não são autenticação.
+- O botão de compartilhar abre o seletor nativo do navegador. A aplicação mantém o vídeo capturado localmente e publica no LiveKit apenas as faixas de compartilhamento de tela e o áudio fornecido pela captura.
+- Os espectadores assinam as faixas pelo LiveKit. O backend Socket.IO continua atualizando presença e estado da transmissão; ele não encaminha SDP, candidatos ICE ou mídia.
+- O token LiveKit é gerado pelo backend e limitado à sala. Ele começa sem permissão para publicar; o backend habilita apenas fontes de compartilhamento de tela para quem adquiriu o bloqueio exclusivo, e revoga a permissão ao parar. A API key e o segredo não são enviados ao frontend.
+- O navegador pode exigir um clique em **Ativar áudio da transmissão** para liberar a reprodução automática.
+- Ao desconectar, a presença é removida e o app tenta reconectar. O cliente LiveKit também tenta recuperar a sessão de mídia.
 
-O servidor fornece STUN do Google por padrão. TURN é opcional e pode ser ativado com um serviço Coturn compatível com a API REST de credenciais temporárias. No Render, configure `TURN_URLS` (URLs `turn:`/`turns:` separadas por vírgula) e `TURN_SECRET` (o segredo compartilhado com Coturn). O backend gera credenciais HMAC de curta duração no endpoint `/api/ice-servers`; o segredo nunca é enviado ao frontend. `TURN_CREDENTIAL_TTL_SECONDS` pode controlar a validade, limitada a 24 horas. Sem essas variáveis, a conexão tenta STUN e a comunicação direta.
+## Captura e áudio
 
-O projeto não fornece uma infraestrutura TURN hospedada. Para redes que bloqueiam P2P, contrate/configure Coturn ou um provedor TURN e informe suas URLs e segredo no backend. TURN encaminha mídia e pode gerar custos de tráfego.
+O navegador continua responsável por pedir a captura e fornecer as faixas. A aplicação mantém o tratamento de áudio por origem que já existia; o SFU não altera o seletor nem fabrica faixas que o navegador não entregou.
 
-## Comportamento do MVP
-
-- Códigos de sala aleatórios com seis caracteres; convites expiram após 15 minutos sem participantes, com limpeza periódica. O servidor limita cada sala a 20 conexões e mantém um teto de 2.000 salas reservadas.
-- Apelidos limitados a 24 caracteres e eventos de sinalização validados no servidor.
-- Uma transmissão de tela por vez. Outras pessoas podem assistir; uma nova transmissão é recusada até a atual parar.
-- O botão muda para **Parar de compartilhar** durante a transmissão. Encerrar pela interface do navegador também encerra a transmissão na sala.
-- O botão **Compartilhar tela** abre diretamente o seletor do navegador, que oferece as origens disponíveis no sistema. A aplicação solicita áudio da origem escolhida e mantém o vídeo mesmo quando o navegador não fornece uma faixa de áudio.
-- Guias e janelas solicitam o áudio da origem selecionada; telas inteiras não oferecem loopback do sistema. Para janelas, uma faixa explicitamente identificada como loopback geral é omitida para não misturar outros aplicativos. Quando o navegador não fornece áudio isolado, o vídeo segue sem áudio e a interface informa o motivo.
-- Se o navegador bloquear a reprodução automática, aparece o botão **Ativar áudio da transmissão** ou **Reproduzir transmissão**; é preciso clicar para liberar a reprodução.
-- Uma pessoa que entra durante uma transmissão recebe uma conexão WebRTC do participante que está compartilhando.
-- Ao desconectar, o servidor remove a pessoa e atualiza a sala. O cliente tenta reconectar automaticamente.
-
-WebRTC P2P conecta o participante que transmite diretamente a cada espectador. O limite de 20 atende ao grupo alvo, mas quem transmite envia uma cópia da mídia a cada participante; conexões com muitos espectadores ou upload limitado podem ficar instáveis. Migrar para um SFU seria o próximo passo se isso ocorrer.
-
-## Captura, adaptação e diagnóstico WebRTC
-
-- A captura pede 1280×720 a 30 FPS, com limites de 1920×1080 e 30 FPS para evitar captura 4K/60 desnecessária. São preferências/limites da captura do navegador; cada sistema pode fornecer uma resolução ou cadência menor.
-- A prévia de quem transmite usa diretamente o `MediaStream` capturado. O vídeo não passa por canvas, filtros ou cópias para redimensionamento em JavaScript. As faixas de áudio continuam seguindo as regras por origem descritas acima.
-- Cada envio de vídeo recebe um teto inicial de até 4 Mbps, dividido por espectador com orçamento de referência de 12 Mbps no total do mesh. A cada 2 segundos o cliente consulta `RTCPeerConnection.getStats()`. Perda, RTT, jitter, estimativa de banda disponível e o motivo de limitação reportado pelo navegador podem reduzir bitrate, resolução e, em condições piores, FPS. A recuperação de qualidade é gradual após amostras estáveis; o controle de congestionamento nativo do WebRTC continua ativo. Esses números são limites iniciais de política, não garantias de bitrate ou de qualidade.
-- A negociação de codec permanece com o navegador para evitar impor um codec incompatível ou mais caro para determinado aparelho. O painel mostra o codec e, quando o navegador fornece esse dado, a implementação do encoder e o tempo médio de codificação por quadro. O navegador também escolhe se usa aceleração de hardware; a aplicação não consegue forçá-la de forma portátil.
-- Abra uma sala com `?debug=webrtc` no endereço, por exemplo `http://localhost:5173/sala/ABC123?debug=webrtc`, para mostrar o painel somente nessa sessão. Ele exibe conexões, estados ICE/PeerConnection, TX/RX, banda estimada, RTT, jitter, perda, FPS, resolução, contadores de quadros, codec, encoder e adaptação aplicada. Métricas indisponíveis aparecem como `—` porque o suporte varia entre navegadores.
-- Se um peer ficar `disconnected` por 5 segundos ou entrar em `failed`, o app tenta uma nova conexão com ICE e renegociação, com espera exponencial e até cinco tentativas. Fechar a sala ou a transmissão cancela temporizadores, conexões e faixas locais.
-- A sinalização continua trafegando apenas entrada/saída da sala, SDP e ICE pelo Socket.IO. O servidor não recebe a mídia; áudio e vídeo continuam P2P. Em malha P2P, cada espectador adiciona outra conexão e cópia de envio, então os limites de bitrate reduzem o consumo, mas não substituem um SFU em grupos grandes.
-
-O navegador não oferece uma API web portátil para ler uso total de CPU, GPU, RAM ou VRAM, nem para obrigar codificação por hardware. `qualityLimitationReason`, implementação de encoder e tempo de codificação são indicadores úteis, não telemetria completa do sistema. Para validar desempenho real, compare o painel com o monitor de tarefas do sistema e repita a matriz abaixo em diferentes dispositivos, navegadores e redes. O build e o smoke test do servidor não simulam perda de rede nem codificação de tela real.
-
-### Matriz manual para validar a mídia
-
-Esses cenários ainda precisam ser exercitados em computadores e conexões reais. Use dois participantes em máquinas separadas e abra `?debug=webrtc` em ambas:
-
-1. Em um computador potente, compartilhe monitor e janela a 1080p/30; confirme que a resolução enviada não passa de 1080p e o FPS reportado fica estável perto de 30. O perfil atual limita a captura a 30 FPS; comparar 60 FPS requer uma variante de experimento com outro teto.
-2. Em um computador intermediário, compartilhe conteúdo com muito movimento e depois conteúdo estático; observe FPS, resolução, encode por quadro e `qualityLimitationReason`.
-3. Em um computador de menor capacidade, verifique o indicador `cpu`, quedas de FPS, estabilidade do áudio e uso de CPU/GPU/RAM no monitor do sistema.
-4. Repita com rede rápida, média e instável usando um limitador de tráfego no roteador ou no sistema operacional. Confira se os níveis de adaptação descem sob perda/RTT/jitter e sobem gradualmente após estabilização.
-5. Teste separadamente guia, janela e tela inteira, conferindo as faixas disponíveis. Sistema de áudio geral não é oferecido; guias e janelas podem fornecer áudio próprio conforme o navegador. Registre também navegador, sistema operacional, codec/encoder reportados e quantidade de espectadores.
+O botão **Parar de compartilhar** encerra as faixas locais e informa o backend para liberar a sala. O encerramento pelo seletor do navegador também para a transmissão.
 
 ## Limitações conhecidas
 
-- Captura de tela requer HTTPS (ou `localhost`) e costuma estar disponível apenas em navegadores desktop. Celulares podem entrar e assistir, mas a captura pode não ser suportada pelo sistema/navegador.
-- Compartilhar áudio de tela varia por navegador, sistema operacional e origem selecionada na janela nativa de captura.
-- A captura nativa de áudio por processo funciona somente quando a ponte local está instalada e executando. O serviço desta versão aceita apenas `http://localhost:5173`; a versão publicada no GitHub Pages ainda precisa ser empacotada com uma aplicação desktop/ponte distribuível para oferecer áudio de janela.
-- O estado das salas não sobrevive ao reinício do backend.
-- A verificação em navegadores, redes distintas, celular, 20 participantes e TURN exige publicar/configurar a infraestrutura. O código inclui o suporte, mas não afirma que esses cenários foram exercitados neste ambiente.
-- Nomes não são autenticação; qualquer pessoa com o link pode entrar enquanto houver vaga.
+- `getDisplayMedia()` requer HTTPS (ou `localhost`) e a captura costuma estar disponível em navegadores desktop. Celulares podem assistir, mas nem todos suportam captura de tela.
+- A disponibilidade e a origem do áudio dependem do navegador, do sistema operacional e da opção escolhida no seletor do navegador.
+- O estado das salas não sobrevive ao reinício do backend. Para persistência, será preciso migrar esse estado para um armazenamento externo.
+- Um SFU reduz o upload do transmissor para uma publicação, mas a mídia passa a consumir banda e recursos do serviço LiveKit. O limite de 20 participantes é um teto de produto, não uma garantia de desempenho.
+- A validação de captura real, qualidade e latência depende de navegadores e redes distintas; o smoke test do backend não substitui essa matriz.
+- O cliente LiveKit JavaScript está fixado na versão 2.18.0. Uma versão posterior testada alterou a configuração ICE depois de iniciar a negociação e falhou no Chromium usado nesta validação; revalide a conexão em Chrome e Edge antes de atualizar essa dependência.
 
 ## Checagem local do servidor
 
-Com backend ativo no segundo terminal, execute:
+Com backend ativo e as variáveis `LIVEKIT_URL`, `LIVEKIT_API_KEY` e `LIVEKIT_API_SECRET` configuradas, execute:
 
 ```sh
 npm run smoke:server
 ```
 
-Esse comando verifica health check, CORS, STUN, criação e limite de salas, código inexistente, limite de 20 participantes, transmissão exclusiva, encaminhamento de sinalização, parada e desconexão. Não substitui os testes de mídia real em navegadores e redes diferentes listados abaixo.
+O smoke test verifica health check, CORS, criação e validação de códigos de sala, limite de participantes, token LiveKit sem permissão inicial de publicação e remoção de participantes ao desconectar. A captura, publicação autorizada, múltiplos espectadores e reconexão dependem de navegador e servidor LiveKit ativos.
 
 ## Build local
 
