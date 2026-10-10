@@ -27,10 +27,10 @@ Abra `http://localhost:5173`. O frontend usa `http://localhost:10000` como servi
 ## Compartilhamento e áudio
 
 - A captura ocorre no navegador com `getDisplayMedia()` e precisa de HTTPS (ou `localhost`). O seletor é aberto diretamente pelo clique em **Compartilhar janela**.
-- A captura pede janela como superfície preferencial e solicita ao navegador uma faixa de áudio da janela. Hints do navegador não garantem que esse áudio exista.
+- A captura pede janela como superfície preferencial, permite áudio do sistema no seletor (`systemAudio: 'include'`) e solicita áudio associado à janela (`windowAudio: 'window'`). São preferências: o navegador pode não fornecer uma faixa.
 - Se o navegador identificar a origem como monitor/tela inteira, o compartilhamento é recusado. Se não informar a superfície capturada, a aplicação também falha de forma segura e pede uma nova seleção.
-- Se a origem for uma guia, o áudio da guia é enviado quando vier na faixa de captura. Para janela de aplicativo, somente uma faixa entregue pela captura e não identificada como áudio do sistema ou microfone é encaminhada. A aplicação não usa `getUserMedia()` nem mistura outra fonte de áudio.
-- Se não houver faixa isolada, o vídeo continua sem áudio e a sala mostra o motivo. Navegadores e sistemas operacionais variam; a Web não oferece uma API portátil para capturar o áudio privado de qualquer processo.
+- Se a origem for uma guia, o áudio da guia continua sendo enviado quando vier na captura. Na janela, uma faixa de áudio do sistema/loopback oferecida pelo navegador é aceita e enviada; ela pode incluir sons de outros aplicativos. A aplicação não usa `getUserMedia()` nem mistura outra fonte de áudio. Faixas identificadas como microfone são omitidas.
+- Se o navegador não fornecer faixa de áudio, o vídeo continua sem áudio e a sala informa o motivo. Navegadores e sistemas operacionais variam; a Web não oferece uma API portátil para capturar o áudio privado de qualquer processo.
 - O botão **Parar de compartilhar** e o encerramento pelo seletor nativo param as faixas e encerram a transmissão para todos na sala.
 - A prévia usa o `MediaStream` diretamente; não há redesenho em canvas.
 
@@ -79,8 +79,8 @@ Teste de mídia manual em dois dispositivos/navegadores:
 
 1. A cria a sala, B entra, A transmite uma janela e B assiste.
 2. A seleciona monitor/tela inteira e confirma que a captura é recusada.
-3. Uma faixa explicitamente identificada como áudio do sistema ou microfone é omitida; vídeo segue sem áudio.
-4. Quando o navegador fornece áudio isolado da guia/janela, B o ouve.
+3. Na captura de janela, confirme que a opção de áudio do sistema do seletor está ativada; se o navegador fornecer loopback, a faixa é transmitida. Faixas identificadas como microfone continuam omitidas.
+4. Quando o navegador fornece áudio para a captura, B o ouve; na janela, o navegador pode fornecer loopback do sistema.
 5. Uma segunda pessoa tenta transmitir e recebe recusa até a primeira parar.
 6. B entra durante a transmissão e recebe vídeo sem refresh.
 7. A encerra pelo botão e pelo seletor nativo; B deixa de ver a transmissão.

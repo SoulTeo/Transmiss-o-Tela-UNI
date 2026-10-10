@@ -4,7 +4,7 @@ import { backendUrl, roomPath } from './config';
 import { PeerMesh, type PeerMetric } from './PeerMesh';
 import type { Participant, ServerAck } from './types';
 
-type AudioSource = 'window' | 'tab' | 'none';
+type AudioSource = 'window' | 'tab' | 'system' | 'none';
 type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
 type JoinResult = ServerAck<{
   roomId: string;
@@ -57,41 +57,54 @@ function prepareCaptureAudio(stream: MediaStream, surface: 'window' | 'browser')
   const audioTracks = stream.getAudioTracks();
   const discarded: MediaStreamTrack[] = [];
   const candidateTracks: MediaStreamTrack[] = [];
+  const systemTracks: MediaStreamTrack[] = [];
   for (const track of audioTracks) {
     const settings = track.getSettings();
     const metadata = `${track.label} ${track.contentHint} ${JSON.stringify(settings)}`;
     const deviceId = settings.deviceId?.toLowerCase() || '';
-    if (track.readyState !== 'live' || deviceId === 'loopback' || SYSTEM_AUDIO_PATTERN.test(metadata) || MICROPHONE_PATTERN.test(metadata)) {
+    const isSystemAudio = deviceId === 'loopback' || SYSTEM_AUDIO_PATTERN.test(metadata);
+    if (track.readyState !== 'live' || MICROPHONE_PATTERN.test(metadata) || (surface === 'browser' && isSystemAudio)) {
       discarded.push(track);
     } else {
       candidateTracks.push(track);
+      if (isSystemAudio) systemTracks.push(track);
     }
   }
 
-  // Never mix multiple captured audio tracks. Keep one browser-provided source at most.
-  const kept = candidateTracks.slice(0, 1);
-  discarded.push(...candidateTracks.slice(1));
+  // A window capture may provide system loopback. Prefer and forward it instead of filtering it.
+  // Tab sharing keeps its existing behavior and excludes any explicitly identified system track.
+  const selected = surface === 'window' ? systemTracks[0] || candidateTracks[0] : candidateTracks[0];
+  const kept = selected ? [selected] : [];
+  discarded.push(...candidateTracks.filter((track) => track !== selected));
   discardTracks(stream, discarded);
 
   if (kept.length) {
-    const source = surface === 'window' ? 'window' : 'tab';
-    const label = surface === 'window' ? 'da janela' : 'da guia';
+    const settings = kept[0].getSettings();
+    const metadata = `${kept[0].label} ${kept[0].contentHint} ${JSON.stringify(settings)}`;
+    const isSystemAudio = surface === 'window' && (settings.deviceId?.toLowerCase() === 'loopback' || SYSTEM_AUDIO_PATTERN.test(metadata));
+    const source: AudioSource = isSystemAudio ? 'system' : surface === 'window' ? 'window' : 'tab';
+    const message = source === 'system'
+      ? 'Áudio do sistema fornecido pelo navegador foi incluído; ele pode conter sons de outros aplicativos.'
+      : source === 'window'
+        ? 'Áudio fornecido pelo navegador para esta captura de janela foi incluído.'
+        : 'Áudio da guia fornecido pelo navegador foi incluído.';
     return {
       audioSource: source,
-      message: `Áudio ${label} fornecido pelo navegador foi incluído.`,
+      message,
       audioTracks: kept,
     };
   }
   const message = discarded.length
-    ? 'O navegador só ofereceu áudio geral do sistema ou microfone; essa faixa foi omitida. O vídeo seguirá sem áudio.'
-    : `O navegador não disponibilizou áudio isolado ${surface === 'window' ? 'para esta janela' : 'para esta guia'}. O vídeo seguirá sem áudio.`;
+    ? 'O navegador só ofereceu áudio de microfone, que não é incluído. O vídeo seguirá sem áudio.'
+    : `O navegador não disponibilizou uma faixa de áudio para ${surface === 'window' ? 'esta janela' : 'esta guia'}. O vídeo seguirá sem áudio.`;
   return { audioSource: 'none', message, audioTracks: [] };
 }
 
 function describeAudioSource(source: AudioSource | null) {
   switch (source) {
-    case 'window': return 'Áudio da janela encaminhado conforme a faixa isolada fornecida pelo navegador.';
+    case 'window': return 'Áudio encaminhado conforme a faixa fornecida pelo navegador para esta janela.';
     case 'tab': return 'Somente o áudio da guia selecionada foi incluído.';
+    case 'system': return 'Áudio de loopback do sistema fornecido pelo navegador foi incluído e pode conter sons de outros aplicativos.';
     case 'none': return 'O navegador não forneceu áudio isolado. A transmissão segue somente com vídeo.';
     default: return 'O navegador pode não fornecer áudio isolado para todas as janelas.';
   }
@@ -537,7 +550,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
         preferCurrentTab: false,
         selfBrowserSurface: 'exclude',
         surfaceSwitching: 'exclude',
-        systemAudio: 'exclude',
+        systemAudio: 'include',
         monitorTypeSurfaces: 'exclude',
         windowAudio: 'window',
       } as unknown as DisplayMediaStreamOptions;
@@ -812,7 +825,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
                 <button className="button button-leave" onClick={() => void leaveRoom()}><Icon name="leave" /> Sair</button>
               </div>
             </div>
-            <p className="screen-audio-note">{isSharing ? localAudioNotice : sharerId ? describeAudioSource(audioSource) : 'Compartilhe uma janela ou guia. O áudio só será enviado se o navegador fornecer uma faixa isolada.'}</p>
+            <p className="screen-audio-note">{isSharing ? localAudioNotice : sharerId ? describeAudioSource(audioSource) : 'Compartilhe uma janela ou guia. O áudio será enviado quando o navegador fornecer uma faixa para a captura.'}</p>
           </>
         )}
       </div>

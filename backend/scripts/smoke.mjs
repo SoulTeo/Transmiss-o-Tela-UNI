@@ -90,10 +90,8 @@ try {
   joined.push({ socket: third, result: await emitAck(third, 'room:join', { roomId, name: 'Pessoa 3' }) });
   assert.ok(joined.every((entry) => entry.result.ok));
 
-  const rejectedSystemAudio = await emitAck(first, 'broadcast:start', { roomId, audioSource: 'system', hasAudio: true });
-  assert.equal(rejectedSystemAudio.ok, false);
   const watcherState = waitFor(second, 'room:state', (state) => state.sharerId === first.id);
-  const started = await emitAck(first, 'broadcast:start', { roomId, audioSource: 'window', hasAudio: true });
+  const started = await emitAck(first, 'broadcast:start', { roomId, audioSource: 'system', hasAudio: true });
   assert.equal(started.ok, true);
   await watcherState;
   const duplicateStart = await emitAck(second, 'broadcast:start', { roomId, audioSource: 'none', hasAudio: false });

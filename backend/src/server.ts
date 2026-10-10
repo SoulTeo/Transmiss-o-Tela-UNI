@@ -8,7 +8,7 @@ type Participant = { id: string; name: string };
 type Room = {
   participants: Map<string, Participant>;
   sharerId: string | null;
-  audioSource: 'window' | 'tab' | 'none' | null;
+  audioSource: 'window' | 'tab' | 'system' | 'none' | null;
   hasAudio: boolean;
   emptyUntil: number | null;
 };
@@ -304,7 +304,7 @@ io.on('connection', (socket) => {
       return;
     }
     if (!room.sharerId) {
-      const audioSources = ['window', 'tab', 'none'];
+      const audioSources = ['window', 'tab', 'system', 'none'];
       if (typeof input.hasAudio !== 'boolean' || !audioSources.includes(String(input.audioSource)) || input.hasAudio !== (input.audioSource !== 'none')) {
         ack(callback, { ok: false, error: 'A origem do áudio da captura é inválida.' });
         return;
