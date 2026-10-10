@@ -5,15 +5,9 @@ services:
     plan: free
     buildCommand: npm ci && npm run build:server
     startCommand: npm start
-    healthCheckPath: /healthz
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
       - key: ALLOWED_ORIGINS
-        sync: false
-      - key: LIVEKIT_URL
-        sync: false
-      - key: LIVEKIT_API_KEY
-        sync: false
-      - key: LIVEKIT_API_SECRET
         sync: false

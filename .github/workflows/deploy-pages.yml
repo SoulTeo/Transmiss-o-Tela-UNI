@@ -28,17 +28,17 @@ jobs:
       - run: npm ci
       - name: Validate room backend configuration
         env:
-          VITE_BACKEND_URL: ${{ vars.VITE_BACKEND_URL || vars.VITE_SIGNALING_URL }}
+          VITE_SIGNALING_URL: ${{ vars.VITE_SIGNALING_URL || vars.VITE_BACKEND_URL }}
         run: |
-          if [ -z "$VITE_BACKEND_URL" ]; then
-            echo "::error title=Missing backend URL::Set the VITE_BACKEND_URL Actions variable to the HTTPS URL of the room backend."
+          if [ -z "$VITE_SIGNALING_URL" ]; then
+            echo "::error title=Missing signaling URL::Set the VITE_SIGNALING_URL Actions variable to the HTTPS URL of the signaling backend."
             exit 1
           fi
       - name: Build site
         run: npm run build:frontend
         env:
           VITE_BASE_PATH: ${{ steps.pages.outputs.base_path }}/
-          VITE_BACKEND_URL: ${{ vars.VITE_BACKEND_URL || vars.VITE_SIGNALING_URL }}
+          VITE_SIGNALING_URL: ${{ vars.VITE_SIGNALING_URL || vars.VITE_BACKEND_URL }}
       - uses: actions/upload-pages-artifact@v4
         with:
           path: frontend/dist

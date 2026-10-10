@@ -9,7 +9,7 @@ function readRoute(): Route {
   const path = window.location.pathname.startsWith(base)
     ? window.location.pathname.slice(base.length)
     : window.location.pathname;
-  const match = path.match(/^\/?sala\/([A-Za-z0-9]{6})\/?$/);
+  const match = path.match(/^\/?sala\/([A-HJ-NP-Z2-9]{6})\/?$/i);
   return match ? { page: 'room', roomId: match[1].toUpperCase() } : { page: 'home' };
 }
 
@@ -69,7 +69,7 @@ export function App() {
   function enterRoom(event: FormEvent) {
     event.preventDefault();
     const roomId = roomInput.trim().toUpperCase();
-    if (!/^[A-Z0-9]{6}$/.test(roomId)) {
+    if (!/^[A-HJ-NP-Z2-9]{6}$/.test(roomId)) {
       setError('Digite o código de 6 letras ou números que recebeu.');
       return;
     }

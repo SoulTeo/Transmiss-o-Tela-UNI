@@ -1,97 +1,91 @@
-# Partilha — salas de compartilhamento de tela
+# Partilha — salas de compartilhamento de janela
 
-Aplicação de compartilhamento de tela em salas privadas. O frontend usa React, TypeScript e Vite. O backend Node.js mantém as salas e a presença dos participantes por Socket.IO. O LiveKit SFU encaminha áudio e vídeo aos espectadores: o transmissor publica uma cópia no servidor de mídia, em vez de abrir uma conexão P2P para cada pessoa.
+Aplicação web para criar salas, convidar participantes e transmitir uma janela ou guia do navegador em tempo real. O frontend usa React, TypeScript e Vite; o backend Node.js mantém presença e sinalização com Socket.IO. Áudio e vídeo trafegam diretamente por WebRTC P2P entre quem compartilha e cada espectador. O backend não recebe nem grava mídia.
 
-A captura permanece local no navegador de cada transmissor, conforme a decisão para esta migração. Selkies não é usado: ele transmite uma sessão de desktop hospedada em um host, o que mudaria de onde a tela de cada participante é capturada.
+## Executar localmente
 
-A captura continua acontecendo no navegador de quem transmite, por `getDisplayMedia()`. A conexão de mídia usa WebRTC entre cada navegador e o LiveKit, mas a mídia passa pelo SFU; participantes não enviam cópias diretamente uns aos outros.
-
-## Rodar localmente
-
-Requer Node.js 20.19.x ou 22.12 ou mais recente (até a série 26) e o servidor LiveKit instalado. Veja [Running LiveKit locally](https://docs.livekit.io/transport/self-hosting/local/) para instalar o executável no Windows, macOS ou Linux.
-
-Instale as dependências:
+Requer Node.js 20.19 ou mais recente na série 20, ou 22.12 ou mais recente. Instale as dependências na raiz:
 
 ```sh
 npm install
 ```
 
-Inicie o LiveKit em modo de desenvolvimento em um terminal:
-
-```sh
-livekit-server --dev --bind 127.0.0.1
-```
-
-Copie a configuração local de exemplo uma vez:
-
-```powershell
-Copy-Item backend/.env.example backend/.env
-```
-
-Em outro terminal, inicie o backend de salas:
+Em um terminal, inicie o backend de sinalização:
 
 ```sh
 npm run dev:server
 ```
 
-Em um terceiro terminal, inicie o frontend:
+Em outro terminal, inicie o frontend:
 
 ```sh
 npm run dev
 ```
 
-Abra `http://localhost:5173`. As chaves `devkey` e `secret` são apenas as credenciais de desenvolvimento do servidor LiveKit local; nunca as use em produção. Se o backend estiver em outro endereço, defina `VITE_BACKEND_URL` em `frontend/.env.local`.
+Abra `http://localhost:5173`. O frontend usa `http://localhost:10000` como servidor Socket.IO em desenvolvimento. Se o backend estiver em outro endereço, defina `VITE_SIGNALING_URL` em `frontend/.env.local`.
 
-## Publicar
+## Compartilhamento e áudio
 
-O frontend pode continuar no GitHub Pages. Configure a variável de Actions `VITE_BACKEND_URL` com a URL HTTPS do backend de salas. A variável antiga `VITE_SIGNALING_URL` continua aceita como compatibilidade.
+- A captura ocorre no navegador com `getDisplayMedia()` e precisa de HTTPS (ou `localhost`). O seletor é aberto diretamente pelo clique em **Compartilhar janela**.
+- A captura pede janela como superfície preferencial e solicita ao navegador uma faixa de áudio da janela. Hints do navegador não garantem que esse áudio exista.
+- Se o navegador identificar a origem como monitor/tela inteira, o compartilhamento é recusado. Se não informar a superfície capturada, a aplicação também falha de forma segura e pede uma nova seleção.
+- Se a origem for uma guia, o áudio da guia é enviado quando vier na faixa de captura. Para janela de aplicativo, somente uma faixa entregue pela captura e não identificada como áudio do sistema ou microfone é encaminhada. A aplicação não usa `getUserMedia()` nem mistura outra fonte de áudio.
+- Se não houver faixa isolada, o vídeo continua sem áudio e a sala mostra o motivo. Navegadores e sistemas operacionais variam; a Web não oferece uma API portátil para capturar o áudio privado de qualquer processo.
+- O botão **Parar de compartilhar** e o encerramento pelo seletor nativo param as faixas e encerram a transmissão para todos na sala.
+- A prévia usa o `MediaStream` diretamente; não há redesenho em canvas.
 
-O backend Node pode continuar no Render, usando [`render.yaml`](render.yaml). Configure no serviço:
+## Salas e sinalização
 
-- `ALLOWED_ORIGINS`: origem do frontend publicado.
-- `LIVEKIT_URL`: endereço público do LiveKit, começando com `wss://`.
-- `LIVEKIT_API_KEY` e `LIVEKIT_API_SECRET`: credenciais do projeto LiveKit; o segredo fica somente no backend.
+- Códigos de seis caracteres evitam `0`, `O`, `1` e `I`. Salas vazias expiram em 15 minutos. O estado é mantido em memória e desaparece quando o processo reinicia.
+- Cada sala aceita até 20 conexões e uma transmissão. Apelidos têm até 24 caracteres. Não há autenticação: quem recebe o código pode entrar enquanto houver vaga.
+- Quem compartilha cria um `RTCPeerConnection` para cada espectador. Entradas durante uma transmissão recebem uma offer do transmissor sem precisar atualizar a página.
+- Socket.IO encaminha SDP/ICE somente ao participante destinatário, na mesma sala, depois de validar a associação e limitar o tamanho dos payloads. A conexão usa Google STUN por padrão.
+- TURN é opcional. Configure `TURN_URLS`, `TURN_SECRET` e `TURN_CREDENTIAL_TTL_SECONDS` no backend para emitir credenciais HMAC de curta duração para um servidor Coturn compatível com REST. A duração é limitada a 24 horas. O segredo nunca vai ao frontend. Sem essas variáveis, o app usa somente STUN; algumas redes podem bloquear conexões P2P.
+- Em redes que permitem apenas TURN, o servidor TURN externo encaminha a mídia. Sem TURN, a mídia segue diretamente entre navegadores.
+- O bitrate inicial é limitado a 4 Mbps por espectador, com orçamento de referência de 12 Mbps por transmissor. O cliente observa `getStats()` a cada dois segundos e reduz bitrate, resolução e FPS ao detectar degradação; recupera um nível por vez após estabilidade. O congestion control nativo permanece ativo.
+- Desconexões `disconnected` por cinco segundos ou `failed` iniciam recuperação com backoff exponencial e até cinco tentativas. Sair ou parar cancela conexões, timers e faixas locais.
+- O botão de áudio do espectador controla a reprodução recebida. Se autoplay for bloqueado, use **Ativar áudio da transmissão** ou **Reproduzir transmissão**.
 
-O servidor LiveKit é um serviço de mídia separado e não está incluído no manifesto do Render. Em produção, use LiveKit Cloud ou hospede o SFU em uma máquina que permita abrir os endereços de mídia exigidos pelo WebRTC. A configuração padrão self-hosted do LiveKit usa WebSocket/API na porta 7880, WebRTC sobre TCP na 7881 e UDP na faixa 50000–60000; confira [Ports and firewall](https://docs.livekit.io/transport/self-hosting/ports-firewall/) para adaptar as regras ao seu host. O backend de salas não recebe nem grava mídia.
+## Diagnóstico WebRTC
 
-## Comportamento das salas
+Adicione `?debug=webrtc` ao endereço da sala para mostrar estado ICE/PeerConnection, bitrate, RTT, jitter, perda, FPS, resolução, codec, encoder e motivo de limitação quando o navegador expuser esses dados. Dados indisponíveis aparecem como `—`. O painel também mostra navegador, plataforma, superfície escolhida, labels das faixas de áudio capturadas e número de espectadores. CPU/GPU não são exibidos porque não há uma API portátil para essas métricas.
 
-- Os códigos têm seis caracteres; salas vazias expiram após 15 minutos. O estado continua em memória e se perde quando o backend reinicia.
-- Cada sala aceita até 20 participantes e apenas uma transmissão ativa. O backend serializa o início e a parada da transmissão.
-- Apelidos têm até 24 caracteres. Qualquer pessoa com o código pode entrar; nomes não são autenticação.
-- O botão de compartilhar abre o seletor nativo do navegador. A aplicação mantém o vídeo capturado localmente e publica no LiveKit apenas as faixas de compartilhamento de tela e o áudio fornecido pela captura.
-- Os espectadores assinam as faixas pelo LiveKit. O backend Socket.IO continua atualizando presença e estado da transmissão; ele não encaminha SDP, candidatos ICE ou mídia.
-- O token LiveKit é gerado pelo backend e limitado à sala. Ele começa sem permissão para publicar; o backend habilita apenas fontes de compartilhamento de tela para quem adquiriu o bloqueio exclusivo, e revoga a permissão ao parar. A API key e o segredo não são enviados ao frontend.
-- O navegador pode exigir um clique em **Ativar áudio da transmissão** para liberar a reprodução automática.
-- Ao desconectar, a presença é removida e o app tenta reconectar. O cliente LiveKit também tenta recuperar a sessão de mídia.
+## Deploy
 
-## Captura e áudio
+### Frontend — GitHub Pages
 
-O navegador continua responsável por pedir a captura e fornecer as faixas. A aplicação mantém o tratamento de áudio por origem que já existia; o SFU não altera o seletor nem fabrica faixas que o navegador não entregou.
+O workflow em `.github/workflows/deploy-pages.yml` publica o frontend. Defina a variável de Actions `VITE_SIGNALING_URL` com a URL HTTPS do backend Render (sem barra final). O nome antigo `VITE_BACKEND_URL` também é aceito.
 
-O botão **Parar de compartilhar** encerra as faixas locais e informa o backend para liberar a sala. O encerramento pelo seletor do navegador também para a transmissão.
+`frontend/public/404.html` preserva as rotas `/sala/:code` ao atualizar uma página do GitHub Pages.
 
-## Limitações conhecidas
+### Backend — Render
 
-- `getDisplayMedia()` requer HTTPS (ou `localhost`) e a captura costuma estar disponível em navegadores desktop. Celulares podem assistir, mas nem todos suportam captura de tela.
-- A disponibilidade e a origem do áudio dependem do navegador, do sistema operacional e da opção escolhida no seletor do navegador.
-- O estado das salas não sobrevive ao reinício do backend. Para persistência, será preciso migrar esse estado para um armazenamento externo.
-- Um SFU reduz o upload do transmissor para uma publicação, mas a mídia passa a consumir banda e recursos do serviço LiveKit. O limite de 20 participantes é um teto de produto, não uma garantia de desempenho.
-- A validação de captura real, qualidade e latência depende de navegadores e redes distintas; o smoke test do backend não substitui essa matriz.
-- O cliente LiveKit JavaScript está fixado na versão 2.18.0. Uma versão posterior testada alterou a configuração ICE depois de iniciar a negociação e falhou no Chromium usado nesta validação; revalide a conexão em Chrome e Edge antes de atualizar essa dependência.
+O manifesto `render.yaml` publica o servidor Socket.IO no plano Free. Configure `ALLOWED_ORIGINS` com a origem exata do GitHub Pages, sem barra final. O serviço expõe `/health` e também mantém `/healthz` por compatibilidade. `PORT` é fornecida pelo Render.
 
-## Checagem local do servidor
+TURN é opcional e deve apontar para um serviço TURN externo que aceite credenciais Coturn REST. O Render Free é usado aqui somente para HTTP/Socket.IO; não é o destino da mídia.
 
-Com backend ativo e as variáveis `LIVEKIT_URL`, `LIVEKIT_API_KEY` e `LIVEKIT_API_SECRET` configuradas, execute:
+No plano Free, o serviço pode dormir após cerca de 15 minutos sem tráfego, e o primeiro acesso pode demorar até um minuto para acordá-lo. Salas em memória são apagadas quando o processo reinicia.
 
-```sh
-npm run smoke:server
-```
-
-O smoke test verifica health check, CORS, criação e validação de códigos de sala, limite de participantes, token LiveKit sem permissão inicial de publicação e remoção de participantes ao desconectar. A captura, publicação autorizada, múltiplos espectadores e reconexão dependem de navegador e servidor LiveKit ativos.
-
-## Build local
+## Comandos e verificações
 
 ```sh
 npm run build
+npm run smoke:server
 ```
+
+O smoke test cobre health, CORS, retorno STUN, criação e validação de salas, limite de 20 participantes, transmissão exclusiva, roteamento endereçado de SDP/ICE, stop e disconnect. Ele valida a sinalização, não a captura nem a mídia em redes reais.
+
+Teste de mídia manual em dois dispositivos/navegadores:
+
+1. A cria a sala, B entra, A transmite uma janela e B assiste.
+2. A seleciona monitor/tela inteira e confirma que a captura é recusada.
+3. Uma faixa explicitamente identificada como áudio do sistema ou microfone é omitida; vídeo segue sem áudio.
+4. Quando o navegador fornece áudio isolado da guia/janela, B o ouve.
+5. Uma segunda pessoa tenta transmitir e recebe recusa até a primeira parar.
+6. B entra durante a transmissão e recebe vídeo sem refresh.
+7. A encerra pelo botão e pelo seletor nativo; B deixa de ver a transmissão.
+8. Em rede degradada, o diagnóstico mostra a adaptação progressiva de qualidade.
+
+## Fora do escopo
+
+SFU, Selkies, gravação, chat, login, persistência de salas, captura de áudio por processo via app desktop e encoder de hardware forçado.

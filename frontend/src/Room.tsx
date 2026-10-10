@@ -1,125 +1,113 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { ParticipantEvent, Room as LiveKitRoom, RoomEvent, Track, type RemoteTrack } from 'livekit-client';
 import { io, type Socket } from 'socket.io-client';
 import { backendUrl, roomPath } from './config';
+import { PeerMesh, type PeerMetric } from './PeerMesh';
 import type { Participant, ServerAck } from './types';
 
+type AudioSource = 'window' | 'tab' | 'none';
+type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
 type JoinResult = ServerAck<{
   roomId: string;
   self: Participant;
   participants: Participant[];
   sharerId: string | null;
-  audioSource: ShareAudioSource | null;
-  mediaToken: string;
-  mediaUrl: string;
+  audioSource: AudioSource | null;
+  hasAudio: boolean;
 }>;
-type ShareAudioSource = 'system' | 'tab' | 'window' | 'unknown' | 'none';
-type ShareSurface = 'monitor' | 'browser' | 'window' | 'unknown';
-type ShareStarted = { participantId: string; audioSource: ShareAudioSource };
+type PendingSignal = { event: 'signal:offer' | 'signal:answer' | 'signal:ice' | 'signal:restart'; payload: Record<string, unknown> };
+type CaptureAudioResult = { audioSource: AudioSource; message: string; audioTracks: MediaStreamTrack[] };
+type CaptureDebug = { browser: string; platform: string; surface: string; audioLabels: string[]; viewerCount: number };
 
-function waitForPublishPermission(mediaRoom: LiveKitRoom): Promise<void> {
-  const participant = mediaRoom.localParticipant;
-  if (participant.permissions?.canPublish) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const timeout = window.setTimeout(() => {
-      participant.off(ParticipantEvent.ParticipantPermissionsChanged, onPermissionsChanged);
-      reject(new Error('O servidor de mídia não confirmou a permissão de publicação.'));
-    }, 5000);
-    const onPermissionsChanged = () => {
-      if (!participant.permissions?.canPublish) return;
-      window.clearTimeout(timeout);
-      participant.off(ParticipantEvent.ParticipantPermissionsChanged, onPermissionsChanged);
-      resolve();
-    };
-    participant.on(ParticipantEvent.ParticipantPermissionsChanged, onPermissionsChanged);
-  });
-}
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+const SYSTEM_AUDIO_PATTERN = /(?:\b(?:system|desktop|loopback)\s*[- ]?\s*(?:audio|sound)\b|\b(?:audio|sound)\s*(?:of\s*)?(?:the\s*)?(?:system|desktop)\b|\bentire\s+system\b|áudio.{0,18}do\s+sistema|som.{0,18}do\s+sistema|áudio\s+geral|\bloopback\b)/iu;
+const MICROPHONE_PATTERN = /\b(?:microphone|microfone|mic input)\b/iu;
 
-function stopShareOnServer(socket: Socket | null, roomId: string): Promise<void> {
-  if (!socket?.connected) return Promise.resolve();
+function emitAck<T extends Record<string, unknown> = Record<string, never>>(
+  socket: Socket,
+  event: string,
+  payload: Record<string, unknown>,
+  timeoutMs = 8_000,
+): Promise<ServerAck<T>> {
   return new Promise((resolve) => {
-    const timer = window.setTimeout(resolve, 7000);
-    socket.timeout(6500).emit('stream:stop', { roomId }, () => {
-      window.clearTimeout(timer);
-      resolve();
+    socket.timeout(timeoutMs).emit(event, payload, (timeoutError: Error | null, response?: ServerAck<T>) => {
+      resolve(timeoutError || !response ? { ok: false, error: 'O servidor não respondeu. Confira a conexão e tente novamente.' } : response);
     });
   });
 }
 
-function discardAudioTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
+async function loadIceServers(): Promise<RTCIceServer[]> {
+  try {
+    const response = await fetch(`${backendUrl || window.location.origin}/api/ice-servers`, { cache: 'no-store' });
+    if (!response.ok) return DEFAULT_ICE_SERVERS;
+    const data = await response.json() as { iceServers?: RTCIceServer[] };
+    return Array.isArray(data.iceServers) && data.iceServers.length ? data.iceServers : DEFAULT_ICE_SERVERS;
+  } catch {
+    return DEFAULT_ICE_SERVERS;
+  }
+}
+
+function discardTracks(stream: MediaStream, tracks: MediaStreamTrack[]) {
   for (const track of tracks) {
     stream.removeTrack(track);
     track.stop();
   }
 }
 
-function prepareCaptureAudio(stream: MediaStream, capturedSurface?: ShareSurface) {
-  const displaySurface = capturedSurface ?? stream.getVideoTracks()[0]?.getSettings().displaySurface as ShareSurface | undefined;
-  const surface: ShareSurface = displaySurface === 'monitor' || displaySurface === 'browser' || displaySurface === 'window'
-    ? displaySurface
-    : 'unknown';
+function prepareCaptureAudio(stream: MediaStream, surface: 'window' | 'browser'): CaptureAudioResult {
   const audioTracks = stream.getAudioTracks();
-  const liveAudioTracks = audioTracks.filter((track) => track.readyState === 'live');
-  discardAudioTracks(stream, audioTracks.filter((track) => !liveAudioTracks.includes(track)));
-  let audioSource: ShareAudioSource = 'none';
-  let message = '';
-
-  if (surface === 'unknown') {
-    audioSource = liveAudioTracks.length > 0 ? 'unknown' : 'none';
-    message = liveAudioTracks.length > 0
-      ? 'Áudio fornecido pelo navegador; a origem não foi identificada.'
-      : 'O navegador não disponibilizou áudio; a tela será transmitida sem áudio.';
-  } else if (surface === 'window') {
-    const systemAudioTracks = liveAudioTracks.filter((track) => {
-      const deviceId = track.getSettings().deviceId?.toLowerCase() || '';
-      const label = track.label.toLowerCase();
-      return deviceId === 'loopback'
-        || /\b(system|desktop) audio\b|\bsystem sound\b|\bloopback\b/.test(label);
-    });
-    discardAudioTracks(stream, systemAudioTracks);
-    const windowAudioTracks = liveAudioTracks.filter((track) => !systemAudioTracks.includes(track));
-    if (windowAudioTracks.length > 0) {
-      audioSource = 'window';
-      message = 'Áudio da janela fornecido pelo navegador foi encaminhado.';
+  const discarded: MediaStreamTrack[] = [];
+  const candidateTracks: MediaStreamTrack[] = [];
+  for (const track of audioTracks) {
+    const settings = track.getSettings();
+    const metadata = `${track.label} ${track.contentHint} ${JSON.stringify(settings)}`;
+    const deviceId = settings.deviceId?.toLowerCase() || '';
+    if (track.readyState !== 'live' || deviceId === 'loopback' || SYSTEM_AUDIO_PATTERN.test(metadata) || MICROPHONE_PATTERN.test(metadata)) {
+      discarded.push(track);
     } else {
-      audioSource = 'none';
-      message = systemAudioTracks.length > 0
-        ? 'O navegador devolveu áudio geral do sistema, que foi omitido. O vídeo da janela seguirá sem áudio.'
-        : 'O navegador não retornou faixa de áudio para esta janela. O vídeo seguirá sem áudio.';
+      candidateTracks.push(track);
     }
-  } else if (liveAudioTracks.length > 0) {
-    audioSource = surface === 'monitor' ? 'system' : 'tab';
-    message = audioSource === 'system'
-      ? 'Áudio do sistema inteiro incluído na transmissão.'
-      : 'Somente o áudio da aba selecionada foi incluído.';
-  } else {
-    discardAudioTracks(stream, audioTracks);
-    message = surface === 'monitor'
-      ? 'O navegador não disponibilizou áudio do sistema; a tela seguirá sem áudio.'
-      : 'O navegador não disponibilizou áudio da aba; o vídeo seguirá sem áudio.';
   }
 
-  return { audioSource, message };
+  // Never mix multiple captured audio tracks. Keep one browser-provided source at most.
+  const kept = candidateTracks.slice(0, 1);
+  discarded.push(...candidateTracks.slice(1));
+  discardTracks(stream, discarded);
+
+  if (kept.length) {
+    const source = surface === 'window' ? 'window' : 'tab';
+    const label = surface === 'window' ? 'da janela' : 'da guia';
+    return {
+      audioSource: source,
+      message: `Áudio ${label} fornecido pelo navegador foi incluído.`,
+      audioTracks: kept,
+    };
+  }
+  const message = discarded.length
+    ? 'O navegador só ofereceu áudio geral do sistema ou microfone; essa faixa foi omitida. O vídeo seguirá sem áudio.'
+    : `O navegador não disponibilizou áudio isolado ${surface === 'window' ? 'para esta janela' : 'para esta guia'}. O vídeo seguirá sem áudio.`;
+  return { audioSource: 'none', message, audioTracks: [] };
 }
 
-function describeAudioSource(source: ShareAudioSource | null) {
+function describeAudioSource(source: AudioSource | null) {
   switch (source) {
-    case 'system': return 'Áudio do sistema inteiro incluído na transmissão.';
-    case 'tab': return 'Somente o áudio da aba selecionada foi incluído.';
-    case 'window': return 'Áudio da janela encaminhado conforme a faixa fornecida pelo navegador.';
-    case 'unknown': return 'Áudio fornecido pelo navegador; origem não identificada.';
-    case 'none': return 'Esta origem não disponibilizou áudio isolado; a transmissão está sem áudio.';
-    default: return 'O áudio depende da origem selecionada e do que o navegador disponibilizar.';
+    case 'window': return 'Áudio da janela encaminhado conforme a faixa isolada fornecida pelo navegador.';
+    case 'tab': return 'Somente o áudio da guia selecionada foi incluído.';
+    case 'none': return 'O navegador não forneceu áudio isolado. A transmissão segue somente com vídeo.';
+    default: return 'O navegador pode não fornecer áudio isolado para todas as janelas.';
   }
 }
 
-function Icon({ name }: { name: 'screen' | 'copy' | 'leave' | 'sound' | 'users' | 'lock' | 'spark' }) {
+function formatMetric(value: number | null, suffix = '') {
+  if (value === null || !Number.isFinite(value)) return '—';
+  return `${value}${suffix}`;
+}
+
+function Icon({ name }: { name: 'screen' | 'copy' | 'leave' | 'sound' | 'users' | 'spark' }) {
   const common = { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true as const };
   if (name === 'screen') return <svg {...common}><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>;
   if (name === 'copy') return <svg {...common}><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>;
   if (name === 'leave') return <svg {...common}><path d="M10 17l5-5-5-5M15 12H3"/><path d="M12 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-6"/></svg>;
   if (name === 'sound') return <svg {...common}><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>;
-  if (name === 'lock') return <svg {...common}><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3M12 14v3"/></svg>;
   if (name === 'spark') return <svg {...common}><path d="M12 2v20M2 12h20M4.93 4.93l14.14 14.14M19.07 4.93 4.93 19.07"/></svg>;
   return <svg {...common}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>;
 }
@@ -131,7 +119,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [selfId, setSelfId] = useState('');
   const [sharerId, setSharerId] = useState<string | null>(null);
   const [localSharing, setLocalSharing] = useState(false);
-  const [audioSource, setAudioSource] = useState<ShareAudioSource | null>(null);
+  const [audioSource, setAudioSource] = useState<AudioSource | null>(null);
   const [localAudioNotice, setLocalAudioNotice] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [connectionLost, setConnectionLost] = useState(false);
@@ -140,27 +128,38 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [remoteHasAudio, setRemoteHasAudio] = useState<boolean | null>(null);
   const [playbackBlocked, setPlaybackBlocked] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
+  const [peerMetrics, setPeerMetrics] = useState<Record<string, PeerMetric>>({});
+  const [captureDebug, setCaptureDebug] = useState<CaptureDebug | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const socketRef = useRef<Socket | null>(null);
   const nameRef = useRef(name);
   const selfIdRef = useRef('');
-  nameRef.current = name;
+  const sharerIdRef = useRef<string | null>(null);
+  const participantsRef = useRef<Participant[]>([]);
   const mountedRef = useRef(true);
   const joinedRef = useRef(false);
+  const joinInFlightRef = useRef(false);
   const localStreamRef = useRef<MediaStream | null>(null);
-  const mediaRoomRef = useRef<LiveKitRoom | null>(null);
+  const peerMeshRef = useRef<PeerMesh | null>(null);
+  const pendingSignalsRef = useRef<PendingSignal[]>([]);
+  const startingShareRef = useRef(false);
   const stoppingShareRef = useRef(false);
-  const pendingRemoteTracksRef = useRef(new Set<RemoteTrack>());
+  const pendingRemoteTracksRef = useRef<MediaStreamTrack[]>([]);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const stageRef = useRef<HTMLElement | null>(null);
   const audioEnabledRef = useRef(audioEnabled);
+  nameRef.current = name;
+  participantsRef.current = participants;
   audioEnabledRef.current = audioEnabled;
 
   const sharer = useMemo(() => participants.find((person) => person.id === sharerId), [participants, sharerId]);
   const isSharing = joined && localSharing;
+  const debugEnabled = new URLSearchParams(window.location.search).get('debug') === 'webrtc';
   const shareUrl = `${window.location.origin}${roomPath(roomId)}`;
 
   const clearRemoteMedia = useCallback(() => {
-    pendingRemoteTracksRef.current.clear();
+    pendingRemoteTracksRef.current = [];
     const video = remoteVideoRef.current;
     if (video) {
       video.pause();
@@ -175,114 +174,147 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     setPlaybackBlocked(false);
   }, []);
 
-  const attachRemoteTrack = useCallback((track: RemoteTrack) => {
-    if (track.source === Track.Source.ScreenShare && track.kind === Track.Kind.Video) {
+  const attachRemoteTrack = useCallback((track: MediaStreamTrack) => {
+    if (track.kind === 'video') {
       const video = remoteVideoRef.current;
       if (!video) {
-        pendingRemoteTracksRef.current.add(track);
+        pendingRemoteTracksRef.current.push(track);
         return;
       }
-      pendingRemoteTracksRef.current.delete(track);
       video.muted = true;
-      track.attach(video);
-      void video.play().then(
-        () => setPlaybackBlocked(false),
-        () => setPlaybackBlocked(true),
-      );
-    } else if (track.source === Track.Source.ScreenShareAudio && track.kind === Track.Kind.Audio) {
+      video.srcObject = new MediaStream([track]);
+      void video.play().then(() => setPlaybackBlocked(false), () => setPlaybackBlocked(true));
+    } else if (track.kind === 'audio') {
       setRemoteHasAudio(true);
       const audio = remoteAudioRef.current;
       if (!audio) {
-        pendingRemoteTracksRef.current.add(track);
+        pendingRemoteTracksRef.current.push(track);
         return;
       }
-      pendingRemoteTracksRef.current.delete(track);
       audio.muted = !audioEnabledRef.current;
-      track.attach(audio);
-      void audio.play().then(
-        () => setPlaybackBlocked(false),
-        () => setPlaybackBlocked(true),
-      );
+      audio.srcObject = new MediaStream([track]);
+      void audio.play().then(() => setPlaybackBlocked(false), () => setPlaybackBlocked(true));
     }
   }, []);
 
-  const disconnectMediaRoom = useCallback(async () => {
-    const mediaRoom = mediaRoomRef.current;
-    mediaRoomRef.current = null;
-    if (mediaRoom) await mediaRoom.disconnect();
+  const createPeerMesh = useCallback((socket: Socket, participantId: string, iceServers: RTCIceServer[]) => new PeerMesh({
+    socket,
+    participantId,
+    iceServers,
+    onTrack: (track) => {
+      if (mountedRef.current) attachRemoteTrack(track);
+    },
+    onTrackEnded: (track) => {
+      if (!mountedRef.current) return;
+      if (track.kind === 'audio') {
+        const audio = remoteAudioRef.current;
+        if (audio) audio.srcObject = null;
+        setRemoteHasAudio(false);
+      } else {
+        const video = remoteVideoRef.current;
+        if (video) video.srcObject = null;
+      }
+    },
+    onPeerRemoved: (peerId) => {
+      if (mountedRef.current) setPeerMetrics((current) => {
+        const next = { ...current };
+        delete next[peerId];
+        return next;
+      });
+    },
+    onMetric: (metric) => {
+      if (mountedRef.current && debugEnabled) setPeerMetrics((current) => ({ ...current, [metric.peerId]: metric }));
+    },
+    onRecoveryLimit: (peerId) => {
+      if (mountedRef.current) {
+        const person = participantsRef.current.find((item) => item.id === peerId);
+        setError(`A conexão WebRTC com ${person?.name || 'um participante'} não foi recuperada. Peça para entrar novamente na sala.`);
+      }
+    },
+  }), [attachRemoteTrack, debugEnabled]);
+
+  const closePeerMesh = useCallback(() => {
+    peerMeshRef.current?.dispose();
+    peerMeshRef.current = null;
+    pendingSignalsRef.current = [];
+    setPeerMetrics({});
     clearRemoteMedia();
   }, [clearRemoteMedia]);
 
-  const stopLocalTracks = useCallback(async () => {
+  const stopLocalCapture = useCallback(() => {
     const stream = localStreamRef.current;
     localStreamRef.current = null;
-    const mediaRoom = mediaRoomRef.current;
-    if (stream && mediaRoom) {
-      await Promise.allSettled(stream.getTracks().map((track) => mediaRoom.localParticipant.unpublishTrack(track, false)));
-    }
     if (stream) stream.getTracks().forEach((track) => track.stop());
   }, []);
 
+  const stopSharing = useCallback(async () => {
+    if (stoppingShareRef.current) return;
+    if (!localStreamRef.current && !localSharing) return;
+    stoppingShareRef.current = true;
+    const socket = socketRef.current;
+    try {
+      stopLocalCapture();
+      const mesh = peerMeshRef.current;
+      mesh?.setSharer(null);
+      mesh?.stopSharing();
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+      sharerIdRef.current = null;
+      setSharerId(null);
+      setLocalSharing(false);
+      setAudioSource(null);
+      setLocalAudioNotice('');
+      setCaptureDebug((current) => current ? { ...current, viewerCount: 0 } : null);
+      if (socket?.connected) await emitAck(socket, 'broadcast:stop', { roomId }, 6_500);
+    } finally {
+      stoppingShareRef.current = false;
+    }
+  }, [localSharing, roomId, stopLocalCapture]);
+
   const leaveRoom = useCallback(async () => {
     const socket = socketRef.current;
-    await stopLocalTracks();
-    await stopShareOnServer(socket, roomId);
-    await disconnectMediaRoom();
-    socket?.emit('room:leave', { roomId });
-    socket?.disconnect();
+    if (localStreamRef.current) await stopSharing();
+    closePeerMesh();
+    if (socket?.connected) {
+      await emitAck(socket, 'room:leave', { roomId }, 3_000);
+      socket.disconnect();
+    }
     socketRef.current = null;
     joinedRef.current = false;
     setParticipants([]);
+    participantsRef.current = [];
     setJoined(false);
     setSharerId(null);
+    sharerIdRef.current = null;
     setLocalSharing(false);
     setAudioSource(null);
     onHome();
-  }, [disconnectMediaRoom, onHome, roomId, stopLocalTracks]);
+  }, [closePeerMesh, onHome, roomId, stopSharing]);
 
-  const connectMediaRoom = useCallback(async (url: string, token: string) => {
-    if (!url || !token) throw new Error('O servidor não forneceu acesso ao serviço de mídia.');
-    await disconnectMediaRoom();
-    const mediaRoom = new LiveKitRoom({ adaptiveStream: true, dynacast: true });
-    mediaRoom.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
-      if (participant.identity === selfIdRef.current) return;
-      attachRemoteTrack(track);
-    });
-    mediaRoom.on(RoomEvent.TrackUnsubscribed, (track) => {
-      pendingRemoteTracksRef.current.delete(track);
-      if (track.source === Track.Source.ScreenShare && track.kind === Track.Kind.Video) {
-        const video = remoteVideoRef.current;
-        if (video) track.detach(video);
-      } else if (track.source === Track.Source.ScreenShareAudio && track.kind === Track.Kind.Audio) {
-        const audio = remoteAudioRef.current;
-        if (audio) track.detach(audio);
-        setRemoteHasAudio(false);
-      }
-    });
-    mediaRoom.on(RoomEvent.Reconnecting, () => setConnectionLost(true));
-    mediaRoom.on(RoomEvent.Reconnected, () => setConnectionLost(false));
-    mediaRoom.on(RoomEvent.Disconnected, () => {
-      if (mediaRoomRef.current !== mediaRoom || !mountedRef.current) return;
-      mediaRoomRef.current = null;
-      clearRemoteMedia();
-      setConnectionLost(true);
-      setLocalSharing(false);
-      void stopLocalTracks();
-    });
-    mediaRoomRef.current = mediaRoom;
-    try {
-      await mediaRoom.connect(url, token);
-    } catch (connectError) {
-      if (mediaRoomRef.current === mediaRoom) mediaRoomRef.current = null;
-      await mediaRoom.disconnect();
-      throw connectError;
+  const handleSignal = useCallback((event: PendingSignal['event'], payload: Record<string, unknown>) => {
+    const mesh = peerMeshRef.current;
+    if (!mesh) {
+      if (pendingSignalsRef.current.length < 32) pendingSignalsRef.current.push({ event, payload });
+      return;
     }
-  }, [attachRemoteTrack, clearRemoteMedia, disconnectMediaRoom, stopLocalTracks]);
+    const from = typeof payload.fromParticipantId === 'string' ? payload.fromParticipantId : '';
+    if (event === 'signal:offer' && payload.description && typeof payload.description === 'object') {
+      void mesh.receiveOffer(from, payload.description as RTCSessionDescriptionInit);
+    } else if (event === 'signal:answer' && payload.description && typeof payload.description === 'object') {
+      void mesh.receiveAnswer(from, payload.description as RTCSessionDescriptionInit);
+    } else if (event === 'signal:ice' && payload.description && typeof payload.description === 'object') {
+      void mesh.receiveIce(from, payload.description as RTCIceCandidateInit);
+    } else if (event === 'signal:restart') {
+      mesh.receiveRestart(from);
+    }
+  }, []);
 
   const join = useCallback((socket: Socket) => {
+    if (joinInFlightRef.current || joinedRef.current) return;
+    joinInFlightRef.current = true;
     setConnecting(true);
     const cleanName = nameRef.current.trim().replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 24);
     socket.timeout(10_000).emit('room:join', { roomId, name: cleanName }, async (timeoutError: Error | null, result?: JoinResult) => {
+      joinInFlightRef.current = false;
       if (!mountedRef.current) return;
       setConnecting(false);
       if (timeoutError || !result) {
@@ -297,36 +329,50 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
         setJoined(false);
         return;
       }
-      selfIdRef.current = result.self.id;
-      try {
-        await connectMediaRoom(result.mediaUrl, result.mediaToken);
-      } catch {
-        socket.emit('room:leave', { roomId });
-        joinedRef.current = false;
-        setJoined(false);
-        setError('Não foi possível conectar ao serviço de transmissão. Tente novamente em instantes.');
-        return;
-      }
-      if (!mountedRef.current || !socket.connected) {
-        await disconnectMediaRoom();
-        return;
-      }
+      const iceServers = await loadIceServers();
+      if (!mountedRef.current || !socket.connected) return;
+      const mesh = createPeerMesh(socket, result.self.id, iceServers);
+      mesh.setSharer(result.sharerId);
+      peerMeshRef.current?.dispose();
+      peerMeshRef.current = mesh;
+      const pendingSignals = pendingSignalsRef.current;
+      pendingSignalsRef.current = [];
+      for (const pending of pendingSignals) handleSignal(pending.event, pending.payload);
       joinedRef.current = true;
       setJoined(true);
       setError('');
       setConnectionLost(false);
       setSelfId(result.self.id);
+      selfIdRef.current = result.self.id;
       setParticipants(result.participants);
+      participantsRef.current = result.participants;
       setSharerId(result.sharerId);
+      sharerIdRef.current = result.sharerId;
       setAudioSource(result.sharerId ? result.audioSource : null);
+      setRemoteHasAudio(result.sharerId ? result.hasAudio : null);
       sessionStorage.setItem('screen-share-name', cleanName);
     });
-  }, [connectMediaRoom, disconnectMediaRoom, roomId]);
+  }, [createPeerMesh, handleSignal, roomId]);
 
   useEffect(() => {
     if (!joined) return;
-    for (const track of pendingRemoteTracksRef.current) attachRemoteTrack(track);
+    const pending = pendingRemoteTracksRef.current;
+    pendingRemoteTracksRef.current = [];
+    pending.forEach(attachRemoteTrack);
   }, [attachRemoteTrack, joined]);
+
+  useEffect(() => {
+    if (sharerId !== selfId || !localStreamRef.current || !remoteVideoRef.current) return;
+    remoteVideoRef.current.muted = true;
+    remoteVideoRef.current.srcObject = localStreamRef.current;
+    void remoteVideoRef.current.play().catch(() => undefined);
+  }, [localSharing, selfId, sharerId]);
+
+  useEffect(() => {
+    if (sharerId === selfId && localStreamRef.current) {
+      setCaptureDebug((current) => current ? { ...current, viewerCount: participants.filter((person) => person.id !== selfId).length } : current);
+    }
+  }, [participants, selfId, sharerId]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -336,13 +382,12 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 750,
-      reconnectionDelayMax: 5000,
-      timeout: 10000,
+      reconnectionDelayMax: 5_000,
+      timeout: 10_000,
     });
     socketRef.current = socket;
     socket.on('connect', () => {
       setConnectionLost(false);
-      if (joinedRef.current) void disconnectMediaRoom();
       if (nameRef.current.trim()) join(socket);
     });
     socket.on('disconnect', () => {
@@ -350,54 +395,97 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       setConnecting(false);
       setConnectionLost(true);
       joinedRef.current = false;
-      void (async () => {
-        await stopLocalTracks();
-        await disconnectMediaRoom();
-      })();
+      joinInFlightRef.current = false;
+      stopLocalCapture();
+      closePeerMesh();
       setSharerId(null);
+      sharerIdRef.current = null;
       setLocalSharing(false);
       setAudioSource(null);
+      setLocalAudioNotice('');
     });
     socket.on('connect_error', () => setConnectionLost(true));
     socket.on('participant:joined', (participant: Participant) => {
-      setParticipants((current) => current.some((person) => person.id === participant.id) ? current : [...current, participant]);
+      setParticipants((current) => {
+        const next = current.some((person) => person.id === participant.id) ? current : [...current, participant];
+        participantsRef.current = next;
+        return next;
+      });
+      if (sharerIdRef.current === selfIdRef.current && localStreamRef.current) void peerMeshRef.current?.addParticipant(participant.id);
     });
     socket.on('participant:left', ({ participantId }: { participantId: string }) => {
-      setParticipants((current) => current.filter((person) => person.id !== participantId));
+      setParticipants((current) => {
+        const next = current.filter((person) => person.id !== participantId);
+        participantsRef.current = next;
+        return next;
+      });
     });
-    socket.on('stream:started', ({ participantId, audioSource: incomingAudioSource }: ShareStarted) => {
+    socket.on('peer:left', ({ participantId }: { participantId: string }) => peerMeshRef.current?.removeParticipant(participantId));
+    socket.on('room:state', (state: { participants: Participant[]; sharerId: string | null; audioSource: AudioSource | null; hasAudio: boolean }) => {
+      setParticipants(state.participants);
+      participantsRef.current = state.participants;
+      const priorSharer = sharerIdRef.current;
+      sharerIdRef.current = state.sharerId;
+      setSharerId(state.sharerId);
+      setAudioSource(state.sharerId ? state.audioSource : null);
+      if (state.sharerId && state.sharerId !== selfIdRef.current) setRemoteHasAudio(state.hasAudio);
+      if (!state.sharerId && priorSharer) {
+        peerMeshRef.current?.setSharer(null);
+        peerMeshRef.current?.closeAllPeers();
+        clearRemoteMedia();
+      } else {
+        peerMeshRef.current?.setSharer(state.sharerId);
+      }
+    });
+    socket.on('broadcast:started', ({ participantId, audioSource: source, hasAudio }: { participantId: string; audioSource: AudioSource; hasAudio: boolean }) => {
+      sharerIdRef.current = participantId;
       setSharerId(participantId);
-      setAudioSource(incomingAudioSource);
+      setAudioSource(source);
+      setRemoteHasAudio(participantId === selfIdRef.current ? null : hasAudio);
       setPlaybackBlocked(false);
       setError('');
-      setRemoteHasAudio(incomingAudioSource === 'none' ? false : null);
+      peerMeshRef.current?.setSharer(participantId);
     });
-    socket.on('stream:stopped', ({ participantId }: { participantId: string }) => {
-      setSharerId((current) => current === participantId ? null : current);
+    socket.on('broadcast:stopped', ({ participantId }: { participantId: string }) => {
+      if (sharerIdRef.current !== participantId) return;
+      sharerIdRef.current = null;
+      setSharerId(null);
       setAudioSource(null);
+      peerMeshRef.current?.setSharer(null);
+      peerMeshRef.current?.closeAllPeers();
       if (participantId === selfIdRef.current) {
-        void stopLocalTracks();
+        stopLocalCapture();
         setLocalSharing(false);
         setLocalAudioNotice('');
       } else {
         clearRemoteMedia();
       }
     });
+    socket.on('signal:offer', (payload: Record<string, unknown>) => handleSignal('signal:offer', payload));
+    socket.on('signal:answer', (payload: Record<string, unknown>) => handleSignal('signal:answer', payload));
+    socket.on('signal:ice', (payload: Record<string, unknown>) => handleSignal('signal:ice', payload));
+    socket.on('signal:restart', (payload: Record<string, unknown>) => handleSignal('signal:restart', payload));
 
     socket.connect();
     return () => {
       mountedRef.current = false;
       if (socketRef.current === socket) socketRef.current = null;
       joinedRef.current = false;
-      void (async () => {
-        await stopLocalTracks();
-        await stopShareOnServer(socket, roomId);
-        await disconnectMediaRoom();
-        socket.emit('room:leave', { roomId });
+      joinInFlightRef.current = false;
+      stopLocalCapture();
+      peerMeshRef.current?.dispose();
+      peerMeshRef.current = null;
+      if (socket.connected) {
+        void (async () => {
+          await emitAck(socket, 'broadcast:stop', { roomId }, 3_000);
+          await emitAck(socket, 'room:leave', { roomId }, 3_000);
+          socket.disconnect();
+        })();
+      } else {
         socket.disconnect();
-      })();
+      }
     };
-  }, [clearRemoteMedia, disconnectMediaRoom, join, roomId, stopLocalTracks]);
+  }, [clearRemoteMedia, closePeerMesh, handleSignal, join, roomId, stopLocalCapture]);
 
   function enter(event: FormEvent) {
     event.preventDefault();
@@ -415,32 +503,50 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   }
 
   async function startSharing() {
+    if (startingShareRef.current) return;
+    startingShareRef.current = true;
     setError('');
     if (!joined || !socketRef.current?.connected) {
       setError('Aguarde a conexão com a sala antes de compartilhar.');
+      startingShareRef.current = false;
       return;
     }
     if (!navigator.mediaDevices?.getDisplayMedia) {
       setError('Este navegador não permite compartilhar a tela. Experimente a versão mais recente do Chrome, Edge ou Firefox no computador.');
+      startingShareRef.current = false;
       return;
     }
+
     let stream: MediaStream;
     try {
+      // This call must remain synchronous with the click gesture so the native picker is allowed to open.
       const options = {
-        video: { cursor: 'never' },
-        audio: true,
-        // Offer audio from the selected tab/window, but never system loopback.
+        video: {
+          displaySurface: 'window',
+          cursor: 'never',
+          frameRate: { ideal: 30, max: 30 },
+          width: { ideal: 1_280, max: 1_920 },
+          height: { ideal: 720, max: 1_080 },
+        },
+        audio: {
+          suppressLocalAudioPlayback: true,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+        preferCurrentTab: false,
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'exclude',
         systemAudio: 'exclude',
+        monitorTypeSurfaces: 'exclude',
         windowAudio: 'window',
-      } as DisplayMediaStreamOptions & {
-        video: MediaTrackConstraints & { cursor: 'never' };
-        systemAudio: 'exclude';
-        windowAudio: 'window';
-      };
+      } as unknown as DisplayMediaStreamOptions;
       stream = await navigator.mediaDevices.getDisplayMedia(options);
     } catch (captureError) {
-      if (captureError instanceof DOMException && captureError.name === 'NotAllowedError') return;
-      setError('Não foi possível iniciar a captura. Verifique as permissões do navegador e tente novamente.');
+      if (!(captureError instanceof DOMException && captureError.name === 'NotAllowedError')) {
+        setError('Não foi possível iniciar a captura. Verifique as permissões do navegador e tente novamente.');
+      }
+      startingShareRef.current = false;
       return;
     }
 
@@ -448,114 +554,95 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     if (!videoTrack) {
       stream.getTracks().forEach((track) => track.stop());
       setError('O navegador não forneceu uma faixa de vídeo. Tente iniciar o compartilhamento novamente.');
+      startingShareRef.current = false;
       return;
     }
-    const displaySurface = videoTrack?.getSettings().displaySurface as ShareSurface | undefined;
-
-    console.info('[screen-share] origem escolhida pelo navegador', JSON.stringify({
-      displaySurface: displaySurface ?? 'unreported',
-      browserAudioTrackCount: stream.getAudioTracks().length,
-      browserAudioTracks: stream.getAudioTracks().map((track) => ({
-        label: track.label,
-        settings: track.getSettings(),
-      })),
+    const displaySurface = videoTrack.getSettings().displaySurface as ShareSurface | undefined;
+    console.info('[screen-share] captura selecionada', JSON.stringify({
+      browser: navigator.userAgent,
+      platform: navigator.platform || 'unknown',
+      displaySurface: displaySurface || 'unreported',
+      audioTrackCount: stream.getAudioTracks().length,
+      audioTracks: stream.getAudioTracks().map((track) => ({ label: track.label, contentHint: track.contentHint, settings: track.getSettings() })),
     }));
 
-    console.info('[screen-share] getDisplayMedia retornou', JSON.stringify({
-      displaySurface,
-      audioTracks: stream.getAudioTracks().map((track) => ({
-        id: track.id,
-        label: track.label,
-        readyState: track.readyState,
-        muted: track.muted,
-        settings: track.getSettings(),
-      })),
-    }));
+    if (displaySurface === 'monitor') {
+      stream.getTracks().forEach((track) => track.stop());
+      setError('Escolha uma janela, não a tela inteira. A transmissão não foi iniciada.');
+      startingShareRef.current = false;
+      return;
+    }
+    if (displaySurface !== 'window' && displaySurface !== 'browser') {
+      stream.getTracks().forEach((track) => track.stop());
+      setError('O navegador não confirmou que a origem é uma janela ou guia. Escolha uma janela no seletor e tente novamente.');
+      startingShareRef.current = false;
+      return;
+    }
 
     const captureAudio = prepareCaptureAudio(stream, displaySurface);
-    console.info('[screen-share] faixas encaminhadas ao LiveKit SFU', JSON.stringify({
+    const capturedAudioLabels = captureAudio.audioTracks.map((track) => track.label || '—');
+    console.info('[screen-share] faixas validadas para WebRTC', JSON.stringify({
+      displaySurface,
       audioSource: captureAudio.audioSource,
-      liveAudioTrackCount: stream.getAudioTracks().filter((track) => track.readyState === 'live').length,
-      audioTracks: stream.getAudioTracks().map((track) => ({
-        id: track.id,
-        readyState: track.readyState,
-        muted: track.muted,
-        enabled: track.enabled,
-      })),
+      videoTrackCount: stream.getVideoTracks().length,
+      audioTrackCount: captureAudio.audioTracks.length,
+      audioLabels: capturedAudioLabels,
     }));
-
     setLocalAudioNotice(captureAudio.message);
-    let captureEnded = videoTrack?.readyState === 'ended';
-    videoTrack?.addEventListener('ended', () => {
-      captureEnded = true;
+    setAudioSource(captureAudio.audioSource);
+    localStreamRef.current = stream;
+    videoTrack.addEventListener('ended', () => {
       if (localStreamRef.current === stream) void stopSharing();
     }, { once: true });
 
-    const result = await new Promise<ServerAck>((resolve) => {
-      const timer = window.setTimeout(() => resolve({ ok: false, error: 'O servidor não confirmou o início. Confira a conexão e tente novamente.' }), 8000);
-      socketRef.current?.emit('stream:start', { roomId, audioSource: captureAudio.audioSource }, (acknowledgement: ServerAck) => {
-        window.clearTimeout(timer);
-        resolve(acknowledgement);
-      });
-    });
-    if (!result?.ok) {
-      socketRef.current?.emit('stream:stop', { roomId });
+    const socket = socketRef.current;
+    if (!socket?.connected) {
       stream.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
       setLocalAudioNotice('');
-      setError(result?.error || 'Outra pessoa já está compartilhando. Aguarde a transmissão terminar.');
+      setError('A conexão com a sala foi perdida. Reconecte-se antes de compartilhar.');
+      startingShareRef.current = false;
       return;
     }
-    if (captureEnded || videoTrack?.readyState === 'ended') {
-      socketRef.current?.emit('stream:stop', { roomId });
-      stream.getTracks().forEach((track) => track.stop());
-      return;
-    }
-    const mediaRoom = mediaRoomRef.current;
-    if (!mediaRoom || mediaRoom.state !== 'connected') {
-      socketRef.current?.emit('stream:stop', { roomId });
-      stream.getTracks().forEach((track) => track.stop());
-      setLocalAudioNotice('');
-      setError('A conexão com o serviço de transmissão foi perdida. Reconecte-se à sala e tente novamente.');
-      return;
-    }
-    localStreamRef.current = stream;
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
-    setSharerId(selfId);
-    setLocalSharing(true);
-    try {
-      await waitForPublishPermission(mediaRoom);
-      for (const track of stream.getTracks()) {
-        await mediaRoom.localParticipant.publishTrack(track, {
-          source: track.kind === 'video' ? Track.Source.ScreenShare : Track.Source.ScreenShareAudio,
-          name: track.kind === 'video' ? 'screen' : 'screen-audio',
-          stream: 'screen',
-          ...(track.kind === 'video' ? { screenShareEncoding: { maxBitrate: 4_000_000, maxFramerate: 30 } } : {}),
-        });
-      }
-    } catch {
-      await stopLocalTracks();
-      await stopShareOnServer(socketRef.current, roomId);
-      setSharerId(null);
-      setLocalSharing(false);
+    const result = await emitAck(socket, 'broadcast:start', {
+      roomId,
+      audioSource: captureAudio.audioSource,
+      hasAudio: captureAudio.audioTracks.length > 0,
+    });
+    if (!result.ok) {
+      stream.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
       setLocalAudioNotice('');
-      setError('Não foi possível publicar a transmissão no servidor de mídia. Tente novamente.');
-    }
-  }
-
-  async function stopSharing() {
-    if (stoppingShareRef.current) return;
-    stoppingShareRef.current = true;
-    try {
-      await stopLocalTracks();
-      await stopShareOnServer(socketRef.current, roomId);
-      clearRemoteMedia();
-      setSharerId(null);
-      setLocalSharing(false);
       setAudioSource(null);
-      setLocalAudioNotice('');
-    } finally {
-      stoppingShareRef.current = false;
+      setError(result.error || 'Outra pessoa já está compartilhando. Aguarde a transmissão terminar.');
+      startingShareRef.current = false;
+      return;
     }
+    if (videoTrack.readyState !== 'live' || localStreamRef.current !== stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+      await emitAck(socket, 'broadcast:stop', { roomId }, 3_000);
+      startingShareRef.current = false;
+      return;
+    }
+
+    sharerIdRef.current = selfIdRef.current;
+    setSharerId(selfIdRef.current);
+    setLocalSharing(true);
+    const mesh = peerMeshRef.current;
+    mesh?.setSharer(selfIdRef.current);
+    const viewers = participantsRef.current.filter((person) => person.id !== selfIdRef.current).map((person) => person.id);
+    if (mesh) await mesh.startSharing(stream, viewers);
+    setCaptureDebug({
+      browser: navigator.userAgent,
+      platform: navigator.platform || '—',
+      surface: displaySurface,
+      audioLabels: capturedAudioLabels,
+      viewerCount: viewers.length,
+    });
+    startingShareRef.current = false;
   }
 
   async function copyLink() {
@@ -565,7 +652,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     } catch {
       setCopyState('failed');
     }
-    window.setTimeout(() => setCopyState('idle'), 2200);
+    window.setTimeout(() => setCopyState('idle'), 2_200);
   }
 
   function toggleAudio() {
@@ -575,12 +662,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     const audio = remoteAudioRef.current;
     if (!audio) return;
     audio.muted = !nextEnabled;
-    if (nextEnabled) {
-      void audio.play().then(
-        () => setPlaybackBlocked(false),
-        () => setPlaybackBlocked(true),
-      );
-    }
+    if (nextEnabled) void audio.play().then(() => setPlaybackBlocked(false), () => setPlaybackBlocked(true));
   }
 
   function unlockPlayback() {
@@ -590,12 +672,25 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     const audio = remoteAudioRef.current;
     if (audio) {
       audio.muted = false;
-      void audio.play().then(
-        () => setPlaybackBlocked(false),
-        () => setPlaybackBlocked(true),
-      );
+      void audio.play().then(() => setPlaybackBlocked(false), () => setPlaybackBlocked(true));
     }
   }
+
+  async function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else {
+      await stageRef.current?.requestFullscreen();
+    }
+  }
+
+  useEffect(() => {
+    const updateFullscreen = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener('fullscreenchange', updateFullscreen);
+    return () => document.removeEventListener('fullscreenchange', updateFullscreen);
+  }, []);
+
+  const participantNames = new Map(participants.map((person) => [person.id, person.name]));
 
   return (
     <main className="room-shell">
@@ -642,21 +737,24 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
           <>
             {connectionLost && <div className="reconnect-banner"><span className="spinner" /> Conexão perdida. Tentando reconectar à sala…</div>}
             {error && <div className="room-error" role="alert"><span>{error}</span><button onClick={() => setError('')} aria-label="Fechar aviso">×</button></div>}
-            <section className={`stage ${sharerId ? 'stage-live' : ''}`}>
+            <section ref={stageRef} className={`stage ${sharerId ? 'stage-live' : ''}`}>
               {sharerId ? (
                 <>
                   <video ref={remoteVideoRef} className="remote-video" autoPlay playsInline controls={false} muted />
                   {sharerId === selfId ? (
-                    <div className="self-preview"><Icon name="screen" /><span>Sua tela está sendo compartilhada</span><small>Os participantes da sala podem assistir</small></div>
+                    <div className="self-preview"><Icon name="screen" /><span>Sua janela está sendo compartilhada</span><small>Os participantes da sala podem assistir</small></div>
                   ) : (
                     <div className="live-tag"><i /> AO VIVO</div>
+                  )}
+                  {sharerId !== selfId && (
+                    <button className="fullscreen-button" onClick={() => void toggleFullscreen()}>{isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}</button>
                   )}
                   {playbackBlocked && sharerId !== selfId && (
                     <button className="playback-button" onClick={unlockPlayback}>
                       {remoteHasAudio ? 'Ativar áudio da transmissão' : 'Reproduzir transmissão'}
                     </button>
                   )}
-                  {remoteHasAudio === false && sharerId !== selfId && <div className="audio-caption">Esta transmissão não tem uma faixa de áudio disponível.</div>}
+                  {remoteHasAudio === false && sharerId !== selfId && <div className="audio-caption">{describeAudioSource(audioSource)}</div>}
                 </>
               ) : (
                 <div className="empty-stage">
@@ -667,6 +765,24 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
               )}
             </section>
             <audio ref={remoteAudioRef} autoPlay muted={!audioEnabled} className="remote-audio" />
+
+            {debugEnabled && (
+              <section className="webrtc-debug" aria-label="Diagnóstico WebRTC">
+                <div className="webrtc-debug-heading"><strong>Diagnóstico WebRTC</strong><span>{captureDebug ? `${captureDebug.viewerCount} espectador(es)` : `${Object.keys(peerMetrics).length} conexão(ões)`}</span></div>
+                {captureDebug && <p>Agente: {captureDebug.browser || '—'} · SO: {captureDebug.platform || '—'} · Origem: {captureDebug.surface || '—'} · Faixas de áudio: {captureDebug.audioLabels.length ? captureDebug.audioLabels.join(', ') : '—'}</p>}
+                {Object.values(peerMetrics).length ? Object.values(peerMetrics).map((metric) => (
+                  <div className="webrtc-peer" key={metric.peerId}>
+                    <strong>{participantNames.get(metric.peerId) || metric.peerId}</strong>
+                    <span>PC {metric.connectionState || '—'} · ICE {metric.iceState || '—'}</span>
+                    <span>Bitrate {metric.bitrate === null ? '—' : `${(metric.bitrate / 1_000_000).toFixed(2)} Mbps`}</span>
+                    <span>RTT {metric.rtt === null ? '—' : `${(metric.rtt * 1_000).toFixed(0)} ms`} · jitter {metric.jitter === null ? '—' : `${(metric.jitter * 1_000).toFixed(1)} ms`}</span>
+                    <span>Perda {metric.loss === null ? '—' : `${(metric.loss * 100).toFixed(1)}%`} · FPS {formatMetric(metric.fps)}</span>
+                    <span>Resolução {metric.resolution || '—'} · codec {metric.codec || '—'}</span>
+                    <span>Encoder {metric.encoder || '—'} · limitação {metric.qualityLimitationReason || '—'}</span>
+                  </div>
+                )) : <p>Os dados dos peers aparecerão quando houver conexão WebRTC. Métricas não expostas pelo navegador aparecem como —.</p>}
+              </section>
+            )}
 
             <section className="people-strip">
               <div className="people-title"><Icon name="users" /><h2>Na sala</h2><span>{participants.length}<b>/20</b></span></div>
@@ -689,14 +805,14 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
                 {isSharing ? (
                   <button className="button button-stop" onClick={() => void stopSharing()}><span className="stop-square" /> Parar de compartilhar</button>
                 ) : (
-                  <button className="button button-primary share-button" onClick={() => void startSharing()} disabled={Boolean(sharerId) || connectionLost} title={sharerId ? 'Aguarde a transmissão atual terminar' : undefined}>
-                    <Icon name="screen" /> Compartilhar tela
+                  <button className="button button-primary share-button" onClick={() => void startSharing()} disabled={Boolean(sharerId) || connectionLost} title={sharerId ? 'Aguarde a transmissão terminar' : undefined}>
+                    <Icon name="screen" /> Compartilhar janela
                   </button>
                 )}
-                <button className="button button-leave" onClick={leaveRoom}><Icon name="leave" /> Sair</button>
+                <button className="button button-leave" onClick={() => void leaveRoom()}><Icon name="leave" /> Sair</button>
               </div>
             </div>
-            <p className="screen-audio-note">{isSharing ? localAudioNotice : sharerId ? describeAudioSource(audioSource) : 'O áudio depende do navegador e da origem escolhida na janela de compartilhamento.'}</p>
+            <p className="screen-audio-note">{isSharing ? localAudioNotice : sharerId ? describeAudioSource(audioSource) : 'Compartilhe uma janela ou guia. O áudio só será enviado se o navegador fornecer uma faixa isolada.'}</p>
           </>
         )}
       </div>
