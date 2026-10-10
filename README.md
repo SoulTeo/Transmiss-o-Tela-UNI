@@ -22,12 +22,15 @@ Inicie o LiveKit em modo de desenvolvimento em um terminal:
 livekit-server --dev --bind 127.0.0.1
 ```
 
-Em outro terminal PowerShell, configure o backend e inicie as salas:
+Copie a configuração local de exemplo uma vez:
 
 ```powershell
-$env:LIVEKIT_URL = "ws://localhost:7880"
-$env:LIVEKIT_API_KEY = "devkey"
-$env:LIVEKIT_API_SECRET = "secret"
+Copy-Item backend/.env.example backend/.env
+```
+
+Em outro terminal, inicie o backend de salas:
+
+```sh
 npm run dev:server
 ```
 
