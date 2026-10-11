@@ -41,6 +41,17 @@ type PeerMeshOptions = {
 };
 
 const MAX_RECOVERY_ATTEMPTS = 5;
+const OFFER_BATCH_SIZE = 3;
+const OFFER_BATCH_DELAY_MS = 120;
+const MAX_PEER_BITRATE = 4_000_000;
+const TOTAL_UPLOAD_BUDGET = 8_000_000;
+const VIDEO_QUALITY_PROFILES = [
+  { bitrateScale: 1, resolutionScale: 1, maxFramerate: 30 },
+  { bitrateScale: 0.85, resolutionScale: 1, maxFramerate: 30 },
+  { bitrateScale: 0.7, resolutionScale: 1.25, maxFramerate: 24 },
+  { bitrateScale: 0.55, resolutionScale: 1.5, maxFramerate: 20 },
+  { bitrateScale: 0.4, resolutionScale: 2, maxFramerate: 15 },
+] as const;
 type RemoteInboundVideoStats = RTCStats & { kind?: string; roundTripTime?: number; jitter?: number; fractionLost?: number };
 
 export class PeerMesh {
@@ -70,12 +81,20 @@ export class PeerMesh {
   async startSharing(stream: MediaStream, participantIds: string[]) {
     this.localStream = stream;
     this.sharerId = this.participantId;
-    await Promise.all(participantIds.filter((id) => id !== this.participantId).map((id) => this.createOffer(id)));
+    const viewers = [...new Set(participantIds.filter((id) => id !== this.participantId))];
+    for (let offset = 0; offset < viewers.length; offset += OFFER_BATCH_SIZE) {
+      const batch = viewers.slice(offset, offset + OFFER_BATCH_SIZE);
+      await Promise.all(batch.map((id) => this.createOffer(id, false, viewers.length)));
+      if (offset + OFFER_BATCH_SIZE < viewers.length) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, OFFER_BATCH_DELAY_MS));
+      }
+    }
   }
 
   async addParticipant(participantId: string) {
     if (!this.isSharer() || participantId === this.participantId || this.peers.has(participantId)) return;
     await this.createOffer(participantId);
+    await this.applyRoomBudget();
   }
 
   async receiveOffer(fromParticipantId: string, description: RTCSessionDescriptionInit) {
@@ -130,6 +149,7 @@ export class PeerMesh {
 
   removeParticipant(participantId: string) {
     this.closePeer(participantId);
+    if (this.isSharer() && this.localStream) void this.applyRoomBudget();
     this.pendingCandidates.delete(participantId);
     const recoveryTimer = this.recoveryTimers.get(participantId);
     if (recoveryTimer !== undefined) window.clearTimeout(recoveryTimer);
@@ -165,11 +185,12 @@ export class PeerMesh {
     return this.sharerId === this.participantId;
   }
 
-  private async createOffer(peerId: string, iceRestart = false) {
+  private async createOffer(peerId: string, iceRestart = false, viewerCount?: number) {
     if (!this.isSharer() || !this.localStream || this.disposed) return;
     const record = this.createPeer(peerId);
     this.localStream.getTracks().forEach((track) => record.pc.addTrack(track, this.localStream!));
-    await this.applyRoomBudget();
+    const videoSender = record.pc.getSenders().find((sender) => sender.track?.kind === 'video');
+    if (videoSender) await this.applyVideoQuality(videoSender, record.qualityLevel, viewerCount ?? this.peers.size);
     try {
       const offer = await record.pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
       await record.pc.setLocalDescription(offer);
@@ -383,10 +404,10 @@ export class PeerMesh {
     if (bad) {
       record.badSamples += 1;
       record.stableSamples = 0;
-      if (record.badSamples >= 2 && record.qualityLevel < 3) {
+      if (record.badSamples >= 2 && record.qualityLevel < VIDEO_QUALITY_PROFILES.length - 1) {
         record.qualityLevel += 1;
         record.badSamples = 0;
-        await this.applyVideoQuality(videoSender, record.qualityLevel);
+        await this.applyVideoQuality(videoSender, record.qualityLevel, this.peers.size);
       }
     } else {
       record.stableSamples += 1;
@@ -394,7 +415,7 @@ export class PeerMesh {
       if (record.stableSamples >= 5 && record.qualityLevel > 0) {
         record.qualityLevel -= 1;
         record.stableSamples = 0;
-        await this.applyVideoQuality(videoSender, record.qualityLevel);
+        await this.applyVideoQuality(videoSender, record.qualityLevel, this.peers.size);
       }
     }
     if (this.peers.get(peerId) !== record) return;
@@ -402,23 +423,27 @@ export class PeerMesh {
 
   private async applyRoomBudget() {
     const updates: Promise<void>[] = [];
+    const viewers = Math.max(1, this.peers.size);
     for (const record of this.peers.values()) {
       const videoSender = record.pc.getSenders().find((sender) => sender.track?.kind === 'video');
-      if (videoSender) updates.push(this.applyVideoQuality(videoSender, record.qualityLevel));
+      if (videoSender) updates.push(this.applyVideoQuality(videoSender, record.qualityLevel, viewers));
     }
     await Promise.all(updates);
   }
 
-  private async applyVideoQuality(sender: RTCRtpSender, level: number) {
+  private async applyVideoQuality(sender: RTCRtpSender, level: number, viewerCount: number) {
     try {
       const parameters = sender.getParameters();
       if (!parameters.encodings?.length) parameters.encodings = [{}];
-      const viewers = Math.max(1, this.peers.size);
-      const sharedBudget = Math.min(4_000_000, Math.floor(12_000_000 / viewers));
+      const viewers = Math.max(1, viewerCount);
+      const crowdQualityFloor = viewers >= 17 ? 3 : viewers >= 10 ? 2 : viewers >= 5 ? 1 : 0;
+      const profile = VIDEO_QUALITY_PROFILES[Math.max(crowdQualityFloor, Math.min(level, VIDEO_QUALITY_PROFILES.length - 1))];
+      const sharedBudget = Math.min(MAX_PEER_BITRATE, Math.floor(TOTAL_UPLOAD_BUDGET / viewers));
       const encoding = parameters.encodings[0];
-      encoding.maxBitrate = Math.floor(sharedBudget * (level >= 1 ? 0.7 : 1));
-      encoding.scaleResolutionDownBy = level >= 2 ? 1.5 : 1;
-      encoding.maxFramerate = level >= 3 ? 20 : 30;
+      encoding.maxBitrate = Math.max(180_000, Math.floor(sharedBudget * profile.bitrateScale));
+      encoding.scaleResolutionDownBy = profile.resolutionScale;
+      encoding.maxFramerate = profile.maxFramerate;
+      parameters.degradationPreference = 'maintain-framerate';
       await sender.setParameters(parameters);
     } catch (error) {
       console.debug('[webrtc] navegador ignorou ajuste de qualidade', error);

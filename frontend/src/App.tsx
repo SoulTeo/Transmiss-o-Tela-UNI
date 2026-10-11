@@ -84,8 +84,9 @@ export function App() {
     <main className="home-shell">
       <div className="home-card">
         <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
-        <h1>Compartilhe o que está vendo.</h1>
-        <p className="home-copy">Crie uma sala e convide seus amigos por link. Sem cadastro e direto no navegador.</p>
+        <div className="brand-signature"><span>Carpe Diem</span><small>RPG · SALAS DE AVENTURA</small></div>
+        <h1>Reúna seu grupo.</h1>
+        <p className="home-copy">Crie uma sala privada, convide seus companheiros e compartilhe sua tela em tempo real.</p>
 
         <button className="button button-primary create-button" onClick={createRoom} disabled={creating}>
           {creating ? <><span className="spinner" /> Criando sala…</> : 'Criar uma sala'}
@@ -110,7 +111,7 @@ export function App() {
         {error && <p id="home-error" className="error-message" role="alert">{error}</p>}
         <p className="privacy-note"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3M12 14v3"/></svg> A tela é transmitida entre os navegadores e não é gravada.</p>
       </div>
-      <footer className="home-footer">Transmissão em tempo real · até 20 pessoas por sala</footer>
+      <footer className="home-footer">Uma mesa. Muitas jornadas. Até 20 aventureiros por sala.</footer>
     </main>
   );
 }

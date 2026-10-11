@@ -23,6 +23,7 @@ const MAX_SDP_CHARS = 120_000;
 const ROOM_ID_PATTERN = /^[A-HJ-NP-Z2-9]{6}$/;
 const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const DEFAULT_TURN_TTL_SECONDS = 3_600;
+const ROOM_REACTIONS = new Set(['❤️', '👍', '👎', '💀', '🍂', '😃', '👏']);
 type IceServer = { urls: string | string[]; username?: string; credential?: string };
 const rooms = new Map<string, Room>();
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://127.0.0.1:5173')
@@ -289,6 +290,18 @@ io.on('connection', (socket) => {
   socket.on('room:leave', (_payload: unknown, callback: unknown) => {
     leaveCurrentRoom(socket);
     ack(callback, { ok: true });
+  });
+
+  socket.on('reaction:send', (payload: unknown) => {
+    const input = getSignalInput(payload);
+    const roomId = socket.data.roomId as string | undefined;
+    const room = roomId ? rooms.get(roomId) : undefined;
+    const emoji = typeof input?.emoji === 'string' ? input.emoji : '';
+    if (!roomId || !room || !room.participants.has(socket.id) || !ROOM_REACTIONS.has(emoji)) return;
+    const now = Date.now();
+    if (now - Number(socket.data.lastReactionAt || 0) < 350) return;
+    socket.data.lastReactionAt = now;
+    io.to(roomId).emit('reaction:show', { participantId: socket.id, emoji });
   });
 
   socket.on('broadcast:start', (payload: unknown, callback: unknown) => {

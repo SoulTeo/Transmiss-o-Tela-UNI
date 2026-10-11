@@ -15,8 +15,19 @@ type JoinResult = ServerAck<{
   hasAudio: boolean;
 }>;
 type PendingSignal = { event: 'signal:offer' | 'signal:answer' | 'signal:ice' | 'signal:restart'; payload: Record<string, unknown> };
-type CaptureAudioResult = { audioSource: AudioSource; message: string; audioTracks: MediaStreamTrack[] };
+type CaptureAudioResult = { audioSource: AudioSource; audioTracks: MediaStreamTrack[] };
 type CaptureDebug = { browser: string; platform: string; surface: string; audioLabels: string[]; viewerCount: number };
+const REACTIONS = [
+  { emoji: '❤️', label: 'Coração' },
+  { emoji: '👍', label: 'Gostei' },
+  { emoji: '👎', label: 'Não gostei' },
+  { emoji: '💀', label: 'Caveira' },
+  { emoji: '🍂', label: 'Folha de outono' },
+  { emoji: '😃', label: 'Feliz' },
+  { emoji: '👏', label: 'Palmas' },
+] as const;
+type ReactionEmoji = (typeof REACTIONS)[number]['emoji'];
+type FloatingReaction = { id: string; emoji: ReactionEmoji };
 
 const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 const SYSTEM_AUDIO_PATTERN = /(?:\b(?:system|desktop|loopback)\s*[- ]?\s*(?:audio|sound)\b|\b(?:audio|sound)\s*(?:of\s*)?(?:the\s*)?(?:system|desktop)\b|\bentire\s+system\b|áudio.{0,18}do\s+sistema|som.{0,18}do\s+sistema|áudio\s+geral|\bloopback\b)/iu;
@@ -83,21 +94,12 @@ function prepareCaptureAudio(stream: MediaStream, surface: 'window' | 'browser')
     const metadata = `${kept[0].label} ${kept[0].contentHint} ${JSON.stringify(settings)}`;
     const isSystemAudio = surface === 'window' && (settings.deviceId?.toLowerCase() === 'loopback' || SYSTEM_AUDIO_PATTERN.test(metadata));
     const source: AudioSource = isSystemAudio ? 'system' : surface === 'window' ? 'window' : 'tab';
-    const message = source === 'system'
-      ? 'Áudio do sistema fornecido pelo navegador foi incluído; ele pode conter sons de outros aplicativos.'
-      : source === 'window'
-        ? 'Áudio fornecido pelo navegador para esta captura de janela foi incluído.'
-        : 'Áudio da guia fornecido pelo navegador foi incluído.';
     return {
       audioSource: source,
-      message,
       audioTracks: kept,
     };
   }
-  const message = discarded.length
-    ? 'O navegador só ofereceu áudio de microfone, que não é incluído. O vídeo seguirá sem áudio.'
-    : `O navegador não disponibilizou uma faixa de áudio para ${surface === 'window' ? 'esta janela' : 'esta guia'}. O vídeo seguirá sem áudio.`;
-  return { audioSource: 'none', message, audioTracks: [] };
+  return { audioSource: 'none', audioTracks: [] };
 }
 
 function describeAudioSource(source: AudioSource | null) {
@@ -133,7 +135,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [sharerId, setSharerId] = useState<string | null>(null);
   const [localSharing, setLocalSharing] = useState(false);
   const [audioSource, setAudioSource] = useState<AudioSource | null>(null);
-  const [localAudioNotice, setLocalAudioNotice] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [connectionLost, setConnectionLost] = useState(false);
   const [error, setError] = useState('');
@@ -144,6 +145,8 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const [peerMetrics, setPeerMetrics] = useState<Record<string, PeerMetric>>({});
   const [captureDebug, setCaptureDebug] = useState<CaptureDebug | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [viewerControlsVisible, setViewerControlsVisible] = useState(false);
+  const [floatingReactions, setFloatingReactions] = useState<FloatingReaction[]>([]);
   const socketRef = useRef<Socket | null>(null);
   const nameRef = useRef(name);
   const selfIdRef = useRef('');
@@ -161,6 +164,10 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const stageRef = useRef<HTMLElement | null>(null);
+  const viewerControlsTimerRef = useRef<number | null>(null);
+  const reactionTimersRef = useRef<Map<string, number>>(new Map());
+  const reactionSequenceRef = useRef(0);
+  const lastReactionAtRef = useRef(0);
   const audioEnabledRef = useRef(audioEnabled);
   nameRef.current = name;
   participantsRef.current = participants;
@@ -275,7 +282,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       setSharerId(null);
       setLocalSharing(false);
       setAudioSource(null);
-      setLocalAudioNotice('');
       setCaptureDebug((current) => current ? { ...current, viewerCount: 0 } : null);
       if (socket?.connected) await emitAck(socket, 'broadcast:stop', { roomId }, 6_500);
     } finally {
@@ -415,7 +421,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       sharerIdRef.current = null;
       setLocalSharing(false);
       setAudioSource(null);
-      setLocalAudioNotice('');
+      setFloatingReactions([]);
     });
     socket.on('connect_error', () => setConnectionLost(true));
     socket.on('participant:joined', (participant: Participant) => {
@@ -434,6 +440,16 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       });
     });
     socket.on('peer:left', ({ participantId }: { participantId: string }) => peerMeshRef.current?.removeParticipant(participantId));
+    socket.on('reaction:show', ({ participantId, emoji }: { participantId: string; emoji: string }) => {
+      if (!REACTIONS.some((reaction) => reaction.emoji === emoji)) return;
+      const id = `${participantId}-${Date.now()}-${++reactionSequenceRef.current}`;
+      setFloatingReactions((current) => [...current.slice(-11), { id, emoji: emoji as ReactionEmoji }]);
+      const timer = window.setTimeout(() => {
+        setFloatingReactions((current) => current.filter((reaction) => reaction.id !== id));
+        reactionTimersRef.current.delete(id);
+      }, 3_000);
+      reactionTimersRef.current.set(id, timer);
+    });
     socket.on('room:state', (state: { participants: Participant[]; sharerId: string | null; audioSource: AudioSource | null; hasAudio: boolean }) => {
       setParticipants(state.participants);
       participantsRef.current = state.participants;
@@ -464,12 +480,12 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       sharerIdRef.current = null;
       setSharerId(null);
       setAudioSource(null);
+      setFloatingReactions([]);
       peerMeshRef.current?.setSharer(null);
       peerMeshRef.current?.closeAllPeers();
       if (participantId === selfIdRef.current) {
         stopLocalCapture();
         setLocalSharing(false);
-        setLocalAudioNotice('');
       } else {
         clearRemoteMedia();
       }
@@ -601,7 +617,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       audioTrackCount: captureAudio.audioTracks.length,
       audioLabels: capturedAudioLabels,
     }));
-    setLocalAudioNotice(captureAudio.message);
     setAudioSource(captureAudio.audioSource);
     localStreamRef.current = stream;
     videoTrack.addEventListener('ended', () => {
@@ -612,7 +627,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     if (!socket?.connected) {
       stream.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
-      setLocalAudioNotice('');
       setError('A conexão com a sala foi perdida. Reconecte-se antes de compartilhar.');
       startingShareRef.current = false;
       return;
@@ -627,7 +641,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
       stream.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-      setLocalAudioNotice('');
       setAudioSource(null);
       setError(result.error || 'Outra pessoa já está compartilhando. Aguarde a transmissão terminar.');
       startingShareRef.current = false;
@@ -689,18 +702,79 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     }
   }
 
+  function revealViewerControls() {
+    setViewerControlsVisible(true);
+    if (viewerControlsTimerRef.current !== null) window.clearTimeout(viewerControlsTimerRef.current);
+    viewerControlsTimerRef.current = window.setTimeout(() => {
+      setViewerControlsVisible(false);
+      viewerControlsTimerRef.current = null;
+    }, 2800);
+  }
+
+  function hideViewerControls() {
+    if (viewerControlsTimerRef.current !== null) window.clearTimeout(viewerControlsTimerRef.current);
+    viewerControlsTimerRef.current = null;
+    setViewerControlsVisible(false);
+  }
+
+  function sendReaction(emoji: ReactionEmoji) {
+    const socket = socketRef.current;
+    const now = Date.now();
+    if (!joinedRef.current || !socket?.connected || now - lastReactionAtRef.current < 350) return;
+    lastReactionAtRef.current = now;
+    socket.emit('reaction:send', { emoji });
+  }
+
   async function toggleFullscreen() {
-    if (document.fullscreenElement) {
-      await document.exitFullscreen();
-    } else {
-      await stageRef.current?.requestFullscreen();
+    const video = remoteVideoRef.current as (HTMLVideoElement & {
+      webkitEnterFullscreen?: () => void;
+      webkitExitFullscreen?: () => void;
+      webkitDisplayingFullscreen?: boolean;
+    }) | null;
+
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+        return;
+      }
+      if (video?.webkitDisplayingFullscreen) {
+        video.webkitExitFullscreen?.();
+        return;
+      }
+      if (stageRef.current?.requestFullscreen) {
+        await stageRef.current.requestFullscreen();
+        return;
+      }
+      if (video?.webkitEnterFullscreen) {
+        video.webkitEnterFullscreen();
+        return;
+      }
+      setError('Este navegador não oferece tela cheia para a transmissão.');
+    } catch {
+      setError('Não foi possível abrir a transmissão em tela cheia. Tente novamente.');
     }
   }
 
   useEffect(() => {
-    const updateFullscreen = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    const video = remoteVideoRef.current as (HTMLVideoElement & { webkitDisplayingFullscreen?: boolean }) | null;
+    const updateFullscreen = () => setIsFullscreen(Boolean(document.fullscreenElement || video?.webkitDisplayingFullscreen));
+    const enterVideoFullscreen = () => setIsFullscreen(true);
+    const exitVideoFullscreen = () => setIsFullscreen(false);
     document.addEventListener('fullscreenchange', updateFullscreen);
-    return () => document.removeEventListener('fullscreenchange', updateFullscreen);
+    video?.addEventListener('webkitbeginfullscreen', enterVideoFullscreen);
+    video?.addEventListener('webkitendfullscreen', exitVideoFullscreen);
+    updateFullscreen();
+    return () => {
+      document.removeEventListener('fullscreenchange', updateFullscreen);
+      video?.removeEventListener('webkitbeginfullscreen', enterVideoFullscreen);
+      video?.removeEventListener('webkitendfullscreen', exitVideoFullscreen);
+    };
+  }, [joined, sharerId]);
+
+  useEffect(() => () => {
+    if (viewerControlsTimerRef.current !== null) window.clearTimeout(viewerControlsTimerRef.current);
+    for (const timer of reactionTimersRef.current.values()) window.clearTimeout(timer);
+    reactionTimersRef.current.clear();
   }, []);
 
   const participantNames = new Map(participants.map((person) => [person.id, person.name]));
@@ -709,7 +783,7 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
     <main className="room-shell">
       <header className="room-header">
         <button className="room-brand" onClick={onHome} aria-label="Voltar ao início">
-          <span className="mini-mark"><i /><i /><i /></span><span>partilha</span>
+          <span className="mini-mark"><i /><i /><i /></span><span className="room-wordmark"><strong>Carpe Diem</strong><small>RPG</small></span>
         </button>
         <div className="room-heading">
           <span className="room-label">SALA</span>
@@ -750,24 +824,54 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
           <>
             {connectionLost && <div className="reconnect-banner"><span className="spinner" /> Conexão perdida. Tentando reconectar à sala…</div>}
             {error && <div className="room-error" role="alert"><span>{error}</span><button onClick={() => setError('')} aria-label="Fechar aviso">×</button></div>}
-            <section ref={stageRef} className={`stage ${sharerId ? 'stage-live' : ''}`}>
+            <section
+              ref={stageRef}
+              className={`stage ${sharerId ? 'stage-live' : ''} ${viewerControlsVisible ? 'stage-controls-visible' : ''}`}
+              onPointerMove={revealViewerControls}
+              onPointerDown={revealViewerControls}
+              onPointerLeave={(event) => { if (event.pointerType === 'mouse') hideViewerControls(); }}
+            >
               {sharerId ? (
                 <>
                   <video ref={remoteVideoRef} className="remote-video" autoPlay playsInline controls={false} muted />
-                  {sharerId === selfId ? (
-                    <div className="self-preview"><Icon name="screen" /><span>Sua janela está sendo compartilhada</span><small>Os participantes da sala podem assistir</small></div>
-                  ) : (
-                    <div className="live-tag"><i /> AO VIVO</div>
-                  )}
-                  {sharerId !== selfId && (
-                    <button className="fullscreen-button" onClick={() => void toggleFullscreen()}>{isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}</button>
-                  )}
-                  {playbackBlocked && sharerId !== selfId && (
-                    <button className="playback-button" onClick={unlockPlayback}>
-                      {remoteHasAudio ? 'Ativar áudio da transmissão' : 'Reproduzir transmissão'}
-                    </button>
-                  )}
-                  {remoteHasAudio === false && sharerId !== selfId && <div className="audio-caption">{describeAudioSource(audioSource)}</div>}
+                  <div className="viewer-overlay">
+                    {sharerId === selfId && (
+                      <div className="self-preview"><Icon name="screen" /><span>Sua janela está sendo compartilhada</span><small>Os participantes da sala podem assistir</small></div>
+                    )}
+                    {sharerId !== selfId && (
+                      <>
+                        <div className="live-tag"><i /> AO VIVO</div>
+                        <button
+                          className="fullscreen-button"
+                          onClick={() => void toggleFullscreen()}
+                          aria-label={isFullscreen ? 'Sair da tela cheia' : 'Assistir em tela cheia'}
+                          aria-pressed={isFullscreen}
+                          title={isFullscreen ? 'Sair da tela cheia' : 'Assistir em tela cheia'}
+                        >
+                          <svg viewBox="0 0 24 24" aria-hidden="true"><path d={isFullscreen ? 'M8 3v5H3M16 3v5h5M8 21v-5H3m13 5v-5h5' : 'M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5'} /></svg>
+                          <span>{isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}</span>
+                        </button>
+                        {playbackBlocked && (
+                          <button className="playback-button" onClick={unlockPlayback}>
+                            {remoteHasAudio ? 'Ativar áudio da transmissão' : 'Reproduzir transmissão'}
+                          </button>
+                        )}
+                        {remoteHasAudio === false && <div className="audio-caption">{describeAudioSource(audioSource)}</div>}
+                      </>
+                    )}
+                    <div className="reaction-picker" role="group" aria-label="Enviar reação">
+                      {REACTIONS.map(({ emoji, label }) => (
+                        <button key={emoji} className="reaction-button" onClick={() => sendReaction(emoji)} aria-label={`Enviar reação: ${label}`} title={label}>
+                          {emoji}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="floating-reactions" aria-hidden="true">
+                    {floatingReactions.map((reaction, index) => (
+                      <span key={reaction.id} className="floating-reaction" style={{ right: `${12 + (index % 5) * 32}px` }}>{reaction.emoji}</span>
+                    ))}
+                  </div>
                 </>
               ) : (
                 <div className="empty-stage">
@@ -825,7 +929,6 @@ export function Room({ roomId, onHome }: { roomId: string; onHome: () => void })
                 <button className="button button-leave" onClick={() => void leaveRoom()}><Icon name="leave" /> Sair</button>
               </div>
             </div>
-            <p className="screen-audio-note">{isSharing ? localAudioNotice : sharerId ? describeAudioSource(audioSource) : 'Compartilhe uma janela ou guia. O áudio será enviado quando o navegador fornecer uma faixa para a captura.'}</p>
           </>
         )}
       </div>
